@@ -28,25 +28,35 @@
 #include "light_wallet.h"
 
 #include <boost/range/adaptor/indexed.hpp>
+#include <boost/range/adaptor/transformed.hpp>
 #include <ctime>
 #include <limits>
 #include <stdexcept>
 #include <type_traits>
 
+#include "config.h"
 #include "db/string.h"
 #include "error.h"
+#include "lws_version.h"
 #include "time_helper.h"       // monero/contrib/epee/include
 #include "ringct/rctOps.h"     // monero/src
 #include "span.h"              // monero/contrib/epee/include
 #include "util/random_outputs.h"
-#include "wire/crypto.h"
+#include "version.h"           // monero/src
+#include "wire.h"
+#include "wire/adapted/crypto.h"
 #include "wire/error.h"
 #include "wire/json.h"
 #include "wire/traits.h"
 #include "wire/vector.h"
+#include "wire/wrapper/array.h"
+#include "wire/wrapper/defaulted.h"
+#include "wire/wrappers_impl.h"
 
 namespace
 {
+  using max_subaddrs = wire::max_element_count<16384>;
+
   enum class iso_timestamp : std::uint64_t {};
 
   struct rct_bytes
@@ -100,21 +110,27 @@ namespace
 
     rct_bytes rct{};
     rct_bytes const* optional_rct = nullptr;
-    if (unpack(self.data.first.extra).first & lws::db::ringct_output)
+    const auto flags = unpack(self.data.first.extra).first;
+    if (flags & lws::db::ringct_output)
     {
-      crypto::key_derivation derived;
-      if (!crypto::generate_key_derivation(self.data.first.spend_meta.tx_public, self.user_key, derived))
-        MONERO_THROW(lws::error::crypto_failure, "generate_key_derivation failed");
+      if (!(flags & lws::db::coinbase_output))
+      {
+        crypto::key_derivation derived;
+        if (!crypto::generate_key_derivation(self.data.first.spend_meta.tx_public, self.user_key, derived))
+          MONERO_THROW(lws::error::crypto_failure, "generate_key_derivation failed");
 
-      crypto::secret_key scalar;
-      rct::ecdhTuple encrypted{self.data.first.ringct_mask, rct::d2h(self.data.first.spend_meta.amount)};
+        crypto::secret_key scalar;
+        rct::ecdhTuple encrypted{self.data.first.ringct_mask, rct::d2h(self.data.first.spend_meta.amount)};
 
-      crypto::derivation_to_scalar(derived, self.data.first.spend_meta.index, scalar);
-      rct::ecdhEncode(encrypted, rct::sk2rct(scalar), false);
+        crypto::derivation_to_scalar(derived, self.data.first.spend_meta.index, scalar);
+        rct::ecdhEncode(encrypted, rct::sk2rct(scalar), false);
 
-      rct.commitment = rct::commit(self.data.first.spend_meta.amount, self.data.first.ringct_mask);
-      rct.mask = encrypted.mask;
-      rct.amount = encrypted.amount;
+        rct.commitment = rct::commit(self.data.first.spend_meta.amount, self.data.first.ringct_mask);
+        rct.mask = encrypted.mask;
+        rct.amount = encrypted.amount;
+      }
+      else
+        rct.mask = rct::identity();
 
       optional_rct = std::addressof(rct);
     }
@@ -131,7 +147,8 @@ namespace
       wire::field("timestamp", iso_timestamp(self.data.first.timestamp)),
       wire::field("height", self.data.first.link.height),
       wire::field("spend_key_images", std::cref(self.data.second)),
-      wire::optional_field("rct", optional_rct)
+      wire::optional_field("rct", optional_rct),
+      wire::field("recipient", std::cref(self.data.first.recipient))
     );
   }
 
@@ -174,7 +191,7 @@ namespace lws
   }
   void rpc::read_bytes(wire::json_reader& source, safe_uint64_array& self)
   {
-    for (std::size_t count = source.start_array(); !source.is_array_end(count); --count)
+    for (std::size_t count = source.start_array(0); !source.is_array_end(count); --count)
       self.values.emplace_back(wire::integer::cast_unsigned<std::uint64_t>(source.safe_unsigned_integer()));
     source.end_array();
   }
@@ -189,6 +206,43 @@ namespace lws
     convert_address(address, self.address);
   }
 
+  namespace rpc
+  {
+    daemon_status_response::daemon_status_response()
+      : outgoing_connections_count(0),
+        incoming_connections_count(0),
+        height(0),
+        network(lws::rpc::network_type(lws::config::network)),
+        state(daemon_state::unavailable)
+    {}
+
+    namespace
+    {
+      constexpr const char* map_daemon_state[] = {"ok", "no_connections", "synchronizing", "unavailable"};
+      constexpr const char* map_network_type[] = {"main", "test", "stage", "fake"};
+    }
+    WIRE_DEFINE_ENUM(daemon_state, map_daemon_state);
+    WIRE_DEFINE_ENUM(network_type, map_network_type);
+  }
+
+  void rpc::write_bytes(wire::json_writer& dest, const daemon_status_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(outgoing_connections_count),
+      WIRE_FIELD(incoming_connections_count),
+      WIRE_FIELD(height),
+      WIRE_FIELD(target_height),
+      WIRE_FIELD(network),
+      WIRE_FIELD(state)
+    );
+  }
+
+  void rpc::write_bytes(wire::json_writer& dest, const new_subaddrs_response& self)
+  {
+    wire::object(dest, WIRE_FIELD(new_subaddrs), WIRE_FIELD(all_subaddrs));
+  }
+
+
   void rpc::write_bytes(wire::json_writer& dest, const transaction_spend& self)
   {
     wire::object(dest,
@@ -196,7 +250,8 @@ namespace lws
       wire::field("key_image", std::cref(self.possible_spend.image)),
       wire::field("tx_pub_key", std::cref(self.meta.tx_public)),
       wire::field("out_index", self.meta.index),
-      wire::field("mixin", self.possible_spend.mixin_count)
+      wire::field("mixin", self.possible_spend.mixin_count),
+      wire::field("sender", std::cref(self.possible_spend.sender))
     );
   }
 
@@ -211,8 +266,10 @@ namespace lws
       WIRE_FIELD_COPY(start_height),
       WIRE_FIELD_COPY(transaction_height),
       WIRE_FIELD_COPY(blockchain_height),
+      WIRE_FIELD_DEFAULTED(lookahead_fail, unsigned(0)),
       WIRE_FIELD(spent_outputs),
-      WIRE_OPTIONAL_FIELD(rates)
+      WIRE_OPTIONAL_FIELD(rates),
+      WIRE_FIELD_DEFAULTED(lookahead, db::address_index{})
     );
   }
 
@@ -242,12 +299,14 @@ namespace lws
         wire::field("timestamp", iso_timestamp(self.value().info.timestamp)),
         wire::field("total_received", safe_uint64(self.value().info.spend_meta.amount)),
         wire::field("total_sent", safe_uint64(self.value().spent)),
+        wire::field("fee", safe_uint64(self.value().info.fee)),
         wire::field("unlock_time", self.value().info.unlock_time),
         wire::field("height", self.value().info.link.height),
         wire::optional_field("payment_id", payment_id),
         wire::field("coinbase", is_coinbase),
         wire::field("mempool", false),
         wire::field("mixin", self.value().info.spend_meta.mixin_count),
+        wire::field("recipient", self.value().info.recipient),
         wire::field("spent_outputs", std::cref(self.value().spends))
       );
     }
@@ -261,7 +320,9 @@ namespace lws
       WIRE_FIELD_COPY(start_height),
       WIRE_FIELD_COPY(transaction_height),
       WIRE_FIELD_COPY(blockchain_height),
-      wire::field("transactions", wire::as_array(boost::adaptors::index(self.transactions)))
+      WIRE_FIELD_DEFAULTED(lookahead_fail, unsigned(0)),
+      WIRE_FIELD_DEFAULTED(lookahead, db::address_index{}),
+      wire::optional_field("transactions", wire::array(boost::adaptors::index(self.transactions)))
     );
   }
 
@@ -272,6 +333,11 @@ namespace lws
   void rpc::write_bytes(wire::json_writer& dest, const get_random_outs_response& self)
   {
     wire::object(dest, WIRE_FIELD(amount_outs));
+  }
+
+  void rpc::write_bytes(wire::json_writer& dest, const get_subaddrs_response& self)
+  {
+    wire::object(dest, WIRE_FIELD(all_subaddrs));
   }
 
   void rpc::read_bytes(wire::json_reader& source, get_unspent_outs_request& self)
@@ -297,17 +363,62 @@ namespace lws
       WIRE_FIELD_COPY(per_byte_fee),
       WIRE_FIELD_COPY(fee_mask),
       WIRE_FIELD_COPY(amount),
-      wire::field("outputs", wire::as_array(std::cref(self.outputs), expand))
+      WIRE_FIELD_DEFAULTED(lookahead_fail, unsigned(0)),
+      wire::optional_field("outputs", wire::array(boost::adaptors::transform(self.outputs, expand))),
+      WIRE_FIELD(fees)
     );
+  }
+
+  rpc::get_version_response::get_version_response(const db::block_id height, const std::uint32_t max_subaddresses)
+    : server_type(lws::version::name),
+      server_version(lws::version::id),
+      last_git_commit_hash(lws::version::commit),
+      last_git_commit_date(lws::version::date),
+      git_branch_name(lws::version::branch),
+      monero_version_full(MONERO_VERSION_FULL),
+      blockchain_height(height),
+      api(lws::version::api::combined),
+      max_subaddresses(max_subaddresses),
+      network(lws::rpc::network_type(lws::config::network)),
+      testnet(config::network == cryptonote::TESTNET) 
+  {}
+  void rpc::write_bytes(wire::json_writer& dest, const get_version_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD(server_type),
+      WIRE_FIELD(server_version),
+      WIRE_FIELD(last_git_commit_hash),
+      WIRE_FIELD(last_git_commit_date),
+      WIRE_FIELD(git_branch_name),
+      WIRE_FIELD(monero_version_full),
+      WIRE_FIELD_COPY(blockchain_height),
+      WIRE_FIELD(api),
+      WIRE_FIELD_COPY(max_subaddresses),
+      wire::field("network_type", self.network),
+      WIRE_FIELD_COPY(testnet)
+    );
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, import_request& self)
+  {
+    std::string address;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      WIRE_FIELD_DEFAULTED(from_height, unsigned(0)),
+      WIRE_FIELD_DEFAULTED(lookahead, db::address_index{})
+    );
+    convert_address(address, self.creds.address);
   }
 
   void rpc::write_bytes(wire::json_writer& dest, const import_response& self)
   {
     wire::object(dest,
       WIRE_FIELD_COPY(import_fee),
-      WIRE_FIELD_COPY(status),
+      WIRE_FIELD(status),
       WIRE_FIELD_COPY(new_request),
-      WIRE_FIELD_COPY(request_fulfilled)
+      WIRE_FIELD_COPY(request_fulfilled),
+      WIRE_FIELD_COPY(lookahead)
     );
   }
 
@@ -317,6 +428,7 @@ namespace lws
     wire::object(source,
       wire::field("address", std::ref(address)),
       wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      WIRE_FIELD_DEFAULTED(lookahead, db::address_index{}),
       WIRE_FIELD(create_account),
       WIRE_FIELD(generated_locally)
     );
@@ -324,7 +436,26 @@ namespace lws
   }
   void rpc::write_bytes(wire::json_writer& dest, const login_response self)
   {
-    wire::object(dest, WIRE_FIELD_COPY(new_address), WIRE_FIELD_COPY(generated_locally));
+    wire::object(dest,
+      WIRE_FIELD_COPY(new_address),
+      WIRE_FIELD_COPY(generated_locally),
+      WIRE_FIELD_COPY(lookahead)
+    );
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, provision_subaddrs_request& self)
+  {
+    std::string address;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      WIRE_OPTIONAL_FIELD(maj_i),
+      WIRE_OPTIONAL_FIELD(min_i),
+      WIRE_OPTIONAL_FIELD(n_maj),
+      WIRE_OPTIONAL_FIELD(n_min),
+      WIRE_OPTIONAL_FIELD(get_all)
+    );
+    convert_address(address, self.creds.address);
   }
 
   void rpc::read_bytes(wire::json_reader& source, submit_raw_tx_request& self)
@@ -334,5 +465,17 @@ namespace lws
   void rpc::write_bytes(wire::json_writer& dest, const submit_raw_tx_response self)
   {
     wire::object(dest, WIRE_FIELD_COPY(status));
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, upsert_subaddrs_request& self)
+  {
+    std::string address;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      WIRE_FIELD_ARRAY(subaddrs, max_subaddrs),
+      WIRE_OPTIONAL_FIELD(get_all)
+    );
+    convert_address(address, self.creds.address);
   }
 } // lws

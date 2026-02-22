@@ -1,7 +1,7 @@
-# monero-lws
+# xfo-lws
 
 > This project is **NOT** a part of the official monero "core" code, but will
-> hopefully be merged into that project as a new repository seperate from the
+> hopefully be merged into that project as a new repository separate from the
 > [`monero-project/monero`](https://github.com/monero-project/monero)
 > repository.
 
@@ -10,8 +10,8 @@
   - [Introduction](#introduction)
   - [About this project](#about-this-project)
   - [License](#license)
-  - [Compiling Monero-lws from source](#compiling-monero-lws-from-source)
-    - [Dependencies](#dependencies)
+  - [Docker](#docker)
+  - [Compiling xfo-lws from source](#compiling-xfo-lws-from-source)
 
 
 ## Introduction
@@ -38,6 +38,7 @@ Differences from [OpenMonero](https://github.com/moneroexamples/openmonero):
   - View keys stored in database - scanning occurs continuously in background
   - Uses ZeroMQ interface to `monerod` with chain subscription ("push") support
   - Uses amd64 ASM acceleration from Monero project, if available
+  - Supports webhook notifications, including "0-conf" notification
 
 
 ## License
@@ -45,97 +46,127 @@ Differences from [OpenMonero](https://github.com/moneroexamples/openmonero):
 See [LICENSE](LICENSE).
 
 
-## Compiling Monero-lws from source
+## Docker
+Data is stored at `/home/xfo-lws/.bitmonero/light_wallet_server` by default,
+and be modified by `--db-path` at runtime.
+
+### Latest Stable Release
+Docker image for latest stable release can be fetched via:
+
+  * `docker pull ghcr.io/vtnerd/xfo-lws`
+  * `docker pull vtnerd/xfo-lws`
+
+Users of this tag should never expect a DB migration issue, provided they never
+"downgrade" to a prior major version.
+
+### Supported Releases
+Docker images for `0` and `0.3` are provided. The major number refers to
+backwards incompatible DB changes, and the minor revision refers to new features
+that could cause instability. Stability minded users can use these tags while
+they are still listed as officially supported here in the README or on the
+Docker overview page.
+
+  * `docker pull ghcr.io/vtnerd/xfo-lws:0`
+  * `docker pull vtnerd/xfo-lws:0`
+  * `docker pull ghcr.io/vtnerd/xfo-lws:0.3`
+  * `docker pull vtnerd/xfo-lws:0.3`
+
+### Alpha Release
+
+Docker image for the `master` (alpha) branch can be fetched via:
+
+  * `docker pull ghcr.io/vtnerd/xfo-lws:master`
+  * `docker pull vtnerd/xfo-lws:master`
+
+This branch differs from the `develop` branch in that users should NOT expect
+incompatible DB changes; if users never "roll-back" their copy of `master` then
+the DB should also be in a valid state for use. However, the `master` version
+is considered alpha software so things could break, resulting in complications
+if the DB was not saved prior to upgrading.
+
+We need alpha testers, so consider using this where possible!
+
+> The `develop` branch should only be used for development purposes - breaking
+> DB changes are expected (but probably rare). No docker image is provided for
+> this branch - see compilation section below.
+
+
+## Compiling xfo-lws from source
 
 ### Dependencies
 
-The following table summarizes the tools and libraries required to build. A
-few of the libraries are also included in this repository (marked as
-"Vendored"). By default, the build uses the library installed on the system,
-and ignores the vendored sources. However, if no library is found installed on
-the system, then the vendored source will be built and used. The vendored
-sources are also used for statically-linked builds because distribution
-packages often include only shared library binaries (`.so`) but not static
-library archives (`.a`).
+The first step, when buiding from source, is installing the [dependencies of the
+monero project](https://github.com/monero-project/monero?tab=readme-ov-file#dependencies).
+`xfo-lws` depends on the monero project for building, so the dependencies of
+that project become the dependencies of this project transitively. Only the
+"non-vendored" dependencies need to be installed. There are no additional
+dependencies that need installing.
 
-| Dep          | Min. version  | Vendored | Debian/Ubuntu pkg    | Arch pkg     | Void pkg           | Fedora pkg          | Optional | Purpose         |
-| ------------ | ------------- | -------- | -------------------- | ------------ | ------------------ | ------------------- | -------- | --------------- |
-| GCC          | 4.7.3         | NO       | `build-essential`    | `base-devel` | `base-devel`       | `gcc`               | NO       |                 |
-| CMake        | 3.1           | NO       | `cmake`              | `cmake`      | `cmake`            | `cmake`             | NO       |                 |
-| Boost        | 1.58          | NO       | `libboost-all-dev`   | `boost`      | `boost-devel`      | `boost-devel`       | NO       | C++ libraries   |
-| monero       | 0.15          | NO       |                      |              |                    |                     | NO       | Monero libraries|
-| OpenSSL      | basically any | NO       | `libssl-dev`         | `openssl`    | `libressl-devel`   | `openssl-devel`     | NO       | sha256 sum      |
-| libzmq       | 3.0.0         | NO       | `libzmq3-dev`        | `zeromq`     | `zeromq-devel`     | `zeromq-devel`      | NO       | ZeroMQ library  |
-| Doxygen      | any           | NO       | `doxygen`            | `doxygen`    | `doxygen`          | `doxygen`           | YES      | Documentation   |
-| Graphviz     | any           | NO       | `graphviz`           | `graphviz`   | `graphviz`         | `graphviz`          | YES      | Documentation   |
+### Beginner Build
 
-Install all dependencies (except `monero-project/monero`) at once on Debian/Ubuntu:
+The easiest method for building is to use git submodules to pull in the correct
+Monero project dependency:
 
-``` sudo apt update && sudo apt install build-essential cmake libboost-all-dev libssl-dev libzmq3-dev doxygen graphviz```
+```bash
+git clone https://github.com/vtnerd/xfo-lws.git
+mkdir xfo-lws/build && cd xfo-lws/build
+git submodule update --init --recursive
+cmake -DCMAKE_BUILD_TYPE=Release ../
+make -j$(nproc)
+```
 
-FreeBSD 12.1 one-liner required to build dependencies:
-```pkg install git gmake cmake pkgconf boost-libs libzmq4```
+  * On macOS replace `-j$(nproc)` with `-j8` or the number of cores on your
+    system.
+  * Each branch (`master`, and `develop`) should have the correct submodule for
+    building that particular branch.
+  * The `submodule` step is being run inside of the `xfo-lws` directory, such
+    that all of vendored dependencies are automatically fetched.
+  * The instructions above will compile the `master` (beta) release of
+    `xfo-lws`
+  * The resulting executables can be found in `xfo-lws/build/src`
 
-### Cloning the repository
+### Advanced Build
 
-Clone recursively to pull-in needed submodule(s):
+The monero source and build directories can be manually specified, which cuts
+the build time in half and potentially re-uses the same source tree for multiple
+builds. The process for advanced building is:
 
-`$ git clone --recursive https://github.com/vtnerd/monero-lws.git`
+```bash
+git clone https://github.com/monero-project/monero.git
+git clone https://github.com/vtnerd/xfo-lws.git
+mkdir xfo-lws/build
+mkdir monero/build && cd monero/build
+git submodule update --init --recursive
+cmake -DCMAKE_BUILD_TYPE=Release ../
+make -j$(nproc) daemon multisig lmdb_lib
+cd ../../xfo-lws/build
+cmake -DCMAKE_BUILD_TYPE=Relase -DMONERO_SOURCE_DIR=../../monero -DMONERO_BUILD_DIR=../../monero/build ../
+make -j$(nproc)
+```
 
-If you already have a repo cloned, initialize and update:
+The `master`/`develop` branches of lws should compile against the `master`
+branch of monero. The release branches specify which monero branch to compile
+against - `release-v0.3_0.18` indicates that monero `0.18` should be used as
+the source directory. The [beginner build process](#beginner-build) handles all
+of this with git submodules.
 
-`$ cd monero-lws && git submodule init && git submodule update`
+  * On macOS replace `-j$(nproc)` with `-j8` or the numebr of cores on your
+    system.
+  * Notice that the `submodule` step is only being run in the `monero` project;
+    `xfo-lws` intentionally does not initialize submodules in the advanced
+    mode of building.
+  * The instructions above will compile the `master` (beta) release of
+    `xfo-lws`.
+  * The resulting executables can be found in `build/src`
 
-### Build instructions
-
-Monero uses the CMake build system and a top-level [Makefile](Makefile) that
-invokes cmake commands as needed.
-
-#### On Linux and macOS
-
-* Install the dependencies. The [`monero`](https://github.com/monero-project/monero)
-  dependency should be cloned and built according to the `README.md` of that
-  project.
-* Change to the root of the source code directory, change to the most recent develop branch, and build:
-
-    ```bash
-    cd monero-lws
-    git checkout develop
-    mkdir build && cd build
-    cmake -DMONERO_SOURCE_DIR=~/monero -DMONERO_BUILD_DIR=~/monero/build ..
-    make
-    ```
-
-    *Optional*: If your machine has several cores and enough memory, enable
-    parallel build by running `make -j<number of threads>` instead of `make`. For
-    this to be worthwhile, the machine should have one core and about 2GB of RAM
-    available per thread.
-
-    *Note*: The instructions above will compile the development release of the
-    Monero-lws software.
-
-* The resulting executables can be found in `build/src`
-
-* Add `PATH="$PATH:$HOME/monero-lws/build/src"` to `.profile`
-
-* Run Monero-lws with `monero-lws-daemon`
-
-Dependencies need to be built with -fPIC. Static libraries usually aren't, so you may have to build them yourself with -fPIC. Refer to their documentation for how to build them.
-
-* **Optional**: build documentation in `doc/html` (omit `HAVE_DOT=YES` if `graphviz` is not installed):
-
-    ```bash
-    HAVE_DOT=YES doxygen Doxyfile
-    ```
-
-## Running monero-lws-daemon
+## Running xfo-lws-daemon
 
 The build places the binary in `src/` sub-directory within the build directory
 from which cmake was invoked (repository root by default). To run in
 foreground:
 
 ```bash
-./src/monero-lws-daemon
+./src/xfo-lws-daemon
 ```
 
-To list all available options, run `./src/monero-lws-daemon --help`.
+To list all available options, run `./src/xfo-lws-daemon --help`.

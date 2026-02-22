@@ -57,6 +57,14 @@ namespace lws
         return "Received invalid transaction from REST client";
       case error::bad_daemon_response:
         return "Response from monerod daemon was bad/unexpected";
+      case error::bad_height:
+        return "Invalid blockchain height";
+      case error::bad_url:
+        return "Invlaid URL";
+      case error::bad_verb:
+        return "Incorrect HTTP verb provided";
+      case error::bad_webhook:
+        return "Invalid webhook request";
       case error::blockchain_reorg:
         return "A blockchain reorg has been detected";
       case error::configuration:
@@ -79,10 +87,18 @@ namespace lws
         return "Unspecified error when retrieving exchange rates";
       case error::http_server:
         return "HTTP server failed";
+      case error::invalid_range:
+        return "Invalid subaddress range provided";
+      case error::json_rpc:
+        return "Error returned by JSON-RPC server";
       case error::exchange_rates_old:
         return "Exchange rates are older than cache interval";
+      case error::max_subaddresses:
+        return "Max subaddresses exceeded";
       case error::not_enough_mixin:
         return "Not enough outputs to meet requested mixin count";
+      case error::not_enough_amount:
+        return "Not enough outputs to meet requested amount";
       case error::signal_abort_process:
         return "An in-process message was received to abort the process";
       case error::signal_abort_scan:
@@ -91,6 +107,8 @@ namespace lws
         return "An unknown in-process message was received";
       case error::system_clock_invalid_range:
         return "System clock is out of range for account storage format";
+      case error::rmq_failure:
+        return "Failure within the RMQ library";
       case error::tx_relay_failed:
         return "The daemon failed to relay transaction from REST client";
       default:

@@ -48,7 +48,6 @@ namespace wire
     struct rapidjson_sax;
 
     std::string source_;
-    epee::span<char> current_;
     rapidjson::Reader reader_;
 
     void read_next_value(rapidjson_sax& handler);
@@ -88,12 +87,9 @@ namespace wire
     //! \throw wire::exception if next token cannot be read as hex into `dest`.
     void binary(epee::span<std::uint8_t> dest) override final;
 
-    //! \throw wire::exception if invalid next token invalid enum. \return Index in `enums`.
-    std::size_t enumeration(epee::span<char const* const> enums) override final;
-
 
     //! \throw wire::exception if next token not `[`.
-    std::size_t start_array() override final;
+    std::size_t start_array(std::size_t) override final;
 
     //! Skips whitespace to next token. \return True if next token is eof or ']'.
     bool is_array_end(std::size_t count) override final;
@@ -107,28 +103,4 @@ namespace wire
         \return True if another value to read. */
     bool key(epee::span<const key_map> map, std::size_t&, std::size_t& index) override final;
   };
-
-
-  // Don't call `read` directly in this namespace, do it from `wire_read`.
-
-  template<typename T>
-  expect<T> json::from_bytes(std::string&& bytes)
-  {
-    json_reader source{std::move(bytes)};
-    return wire_read::to<T>(source);
-  }
-
-  // specialization prevents type "downgrading" to base type in cpp files
-
-  template<typename T>
-  inline void array(json_reader& source, T& dest)
-  {
-    wire_read::array(source, dest);
-  }
-
-  template<typename... T>
-  inline void object(json_reader& source, T... fields)
-  {
-    wire_read::object(source, wire_read::tracker<T>{std::move(fields)}...);
-  }
 } // wire

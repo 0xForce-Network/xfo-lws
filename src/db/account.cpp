@@ -33,6 +33,11 @@
 #include "common/expect.h"
 #include "db/data.h"
 #include "db/string.h"
+#include "wire/adapted/crypto.h"
+#include "wire/adapted/pair.h"
+#include "wire/msgpack.h"
+#include "wire/vector.h"
+#include "wire/wrapper/trusted_array.h"
 
 namespace lws
 {
@@ -50,6 +55,10 @@ namespace lws
 
   struct account::internal
   {
+    internal()
+      : address(), id(db::account_id::invalid), pubs{}, view_key{}
+    {}
+
     explicit internal(db::account const& source)
       : address(db::address_string(source.address)), id(source.id), pubs(source.address), view_key()
     {
@@ -66,17 +75,34 @@ namespace lws
       );
     }
 
+    void read_bytes(wire::msgpack_reader& source)
+    { map(source, *this); }
+
+    void write_bytes(wire::msgpack_writer& dest) const
+    { map(dest, *this); }
+
+    template<typename F, typename T>
+    static void map(F& format, T& self)
+    {
+      wire::object(format,
+        WIRE_FIELD_ID(0, address),
+        WIRE_FIELD_ID(1, id),
+        WIRE_FIELD_ID(2, pubs),
+        WIRE_FIELD_ID(3, view_key)
+      );
+    }
+
     std::string address;
     db::account_id id;
     db::account_address pubs;
     crypto::secret_key view_key;
   };
 
-  account::account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<db::output_id> spendable, std::vector<crypto::public_key> pubs) noexcept
+  account::account(std::shared_ptr<const internal> immutable, db::block_id height, std::vector<std::pair<db::output_id, db::address_index>> spendable, std::vector<crypto::public_key> pubs) noexcept
     : immutable_(std::move(immutable))
     , spendable_(std::move(spendable))
     , pubs_(std::move(pubs))
-      , spends_()
+    , spends_()
     , outputs_()
     , height_(height)
   {}
@@ -87,7 +113,24 @@ namespace lws
       MONERO_THROW(::common_error::kInvalidArgument, "using moved from account");
   }
 
-  account::account(db::account const& source, std::vector<db::output_id> spendable, std::vector<crypto::public_key> pubs)
+  template<typename F, typename T, typename U>
+  void account::map(F& format, T& self, U& immutable)
+  {
+    wire::object(format,
+      wire::field<0>("immutable_", std::ref(immutable)),
+      wire::optional_field<1>("spendable_", wire::trusted_array(std::ref(self.spendable_))),
+      wire::optional_field<2>("pubs_", wire::trusted_array(std::ref(self.pubs_))),
+      wire::optional_field<3>("spends_", wire::trusted_array(std::ref(self.spends_))),
+      wire::optional_field<4>("outputs_", wire::trusted_array(std::ref(self.outputs_))),
+      WIRE_FIELD_ID(5, height_)
+    );
+  }
+
+  account::account() noexcept
+    : immutable_(nullptr), spendable_(), pubs_(), spends_(), outputs_(), height_(db::block_id(0))
+  {}
+
+  account::account(db::account const& source, std::vector<std::pair<db::output_id, db::address_index>> spendable, std::vector<crypto::public_key> pubs)
     : account(std::make_shared<internal>(source), source.scan_height, std::move(spendable), std::move(pubs))
   {
     std::sort(spendable_.begin(), spendable_.end());
@@ -96,6 +139,21 @@ namespace lws
 
   account::~account() noexcept
   {}
+
+  void account::read_bytes(::wire::msgpack_reader& source)
+  {
+    auto immutable = std::make_shared<internal>();
+    map(source, *this, *immutable);
+    immutable_ = std::move(immutable);
+    std::sort(spendable_.begin(), spendable_.end());
+    std::sort(pubs_.begin(), pubs_.end(), sort_pubs{});
+  }
+
+  void account::write_bytes(::wire::msgpack_writer& dest) const
+  {
+    null_check();
+    map(dest, *this, *immutable_);
+  }
 
   account account::clone() const
   {
@@ -107,7 +165,7 @@ namespace lws
 
   void account::updated(db::block_id new_height) noexcept
   {
-    height_ = new_height;
+    height_ = std::max(height_, new_height);
     spends_.clear();
     spends_.shrink_to_fit();
     outputs_.clear();
@@ -151,9 +209,15 @@ namespace lws
     return immutable_->view_key;
   }
 
-  bool account::has_spendable(db::output_id const& id) const noexcept
+  boost::optional<db::address_index> account::get_spendable(db::output_id const& id) const noexcept
   {
-    return std::binary_search(spendable_.begin(), spendable_.end(), id);
+    const auto searchable = 
+      std::make_pair(id, db::address_index{db::major_index::primary, db::minor_index::primary});
+    const auto account =
+      std::lower_bound(spendable_.begin(), spendable_.end(), searchable);
+    if (account == spendable_.end() || account->first != id)
+      return boost::none;
+    return account->second;
   }
 
   bool account::add_out(db::output const& out)
@@ -163,9 +227,10 @@ namespace lws
       return false;
 
     pubs_.insert(existing_pub, out.pub);
+    auto spendable_value = std::make_pair(out.spend_meta.id, out.recipient);
     spendable_.insert(
-      std::lower_bound(spendable_.begin(), spendable_.end(), out.spend_meta.id),
-      out.spend_meta.id
+      std::lower_bound(spendable_.begin(), spendable_.end(), spendable_value),
+      spendable_value
     );
     outputs_.push_back(out);
     return true;
@@ -176,4 +241,5 @@ namespace lws
     spends_.push_back(spend);
   }
 } // lws
+
 

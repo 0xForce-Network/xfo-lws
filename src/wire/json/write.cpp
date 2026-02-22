@@ -54,10 +54,11 @@ namespace wire
     if (!formatter_.IsComplete())
       throw std::logic_error{"json_writer::take_json() failed with incomplete JSON tree"};
   }
-  epee::byte_slice json_writer::take_json()
+  epee::byte_stream json_writer::take_json()
   {
     check_complete();
-    epee::byte_slice out{std::move(bytes_)};
+    epee::byte_stream out{std::move(bytes_)};
+    bytes_.clear();
     formatter_.Reset(bytes_);
     return out;
   }
@@ -127,13 +128,6 @@ namespace wire
       const auto hex = epee::to_hex::string(source);
       string(hex);
       //}
-  }
-
-  void json_writer::enumeration(const std::size_t index, const epee::span<char const* const> enums)
-  {
-    if (enums.size() < index)
-      throw std::logic_error{"Invalid enum/string value"};
-    string({enums[index], std::strlen(enums[index])});
   }
 
   void json_writer::start_array(std::size_t)

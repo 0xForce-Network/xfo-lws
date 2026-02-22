@@ -1,4 +1,4 @@
-// Copyright (c) 2018-2020, The Monero Project
+  // Copyright (c) 2018-2020, The Monero Project
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without modification, are
@@ -26,16 +26,26 @@
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #pragma once
 
+#include <array>
+#include <boost/multiprecision/cpp_int.hpp>
+#include <boost/uuid/uuid.hpp>
 #include <cassert>
 #include <cstdint>
 #include <iosfwd>
+#include <limits>
+#include <string>
+#include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "crypto/crypto.h"
 #include "lmdb/util.h"
 #include "ringct/rctTypes.h" //! \TODO brings in lots of includes, try to remove
 #include "wire/fwd.h"
+#include "wire/json/fwd.h"
+#include "wire/msgpack/fwd.h"
 #include "wire/traits.h"
+#include "wire/wrapper/array.h"
 
 namespace lws
 {
@@ -59,12 +69,22 @@ namespace db
   WIRE_AS_INTEGER(account_time);
 
   //! References a block height
-  enum class block_id : std::uint64_t {};
+  enum class block_id : std::uint64_t
+  {
+    txpool = std::uint64_t(-1) //! Represents not-yet-a-block
+  };
   WIRE_AS_INTEGER(block_id);
+
+  inline constexpr std::uint64_t to_uint(const block_id src) noexcept
+  { return std::uint64_t(src); }
 
   //! References a global output number, as determined by the public chain
   struct output_id
   {
+    //! \return Special ID for outputs not yet in a block.
+    static constexpr output_id txpool() noexcept
+    { return {0, std::numeric_limits<std::uint64_t>::max()}; }
+
     std::uint64_t high; //!< Amount on public chain; rct outputs are `0`
     std::uint64_t low;  //!< Offset within `amount` on the public chain
   };
@@ -81,7 +101,7 @@ namespace db
   enum account_flags : std::uint8_t
   {
     default_account = 0,
-    admin_account   = 1,          //!< Not currently used, for future extensions
+    admin_account   = 1,          //!< Indicates `key` can be used for admin requests
     account_generated_locally = 2 //!< Flag sent by client on initial login request
   };
 
@@ -110,6 +130,56 @@ namespace db
   static_assert(sizeof(account_address) == 64, "padding in account_address");
   WIRE_DECLARE_OBJECT(account_address);
 
+  //! Major index of a subaddress
+  enum class major_index : std::uint32_t { primary = 0 };
+  WIRE_AS_INTEGER(major_index);
+
+  inline constexpr std::uint32_t to_uint(const major_index src) noexcept
+  { return std::uint32_t(src); }
+
+  //! Minor index of a subaddress
+  enum class minor_index : std::uint32_t { primary = 0 };
+  WIRE_AS_INTEGER(minor_index);
+
+  inline constexpr std::uint32_t to_uint(const minor_index src) noexcept
+  { return std::uint32_t(src); }
+
+  //! Range within a major index
+  using index_range = std::array<minor_index, 2>;
+
+  //! Ranges within a major index
+  using min_index_ranges = wire::min_element_size<2>;
+  using index_ranges = wire::array_<std::vector<index_range>, min_index_ranges>;
+
+  //! Compatible with msgpack_table
+  using subaddress_dict = std::pair<major_index, index_ranges>;
+  bool check_subaddress_dict(const subaddress_dict&);
+  WIRE_DECLARE_OBJECT(subaddress_dict);
+
+  //! A specific (sub)address index
+  struct address_index
+  {
+    major_index maj_i;
+    minor_index min_i;
+
+    crypto::public_key get_spend_public(account_address const& base, crypto::secret_key const& view) const;
+    constexpr bool is_zero() const noexcept
+    {
+      return maj_i == major_index::primary && min_i == minor_index::primary;
+    } 
+  };
+  static_assert(sizeof(address_index) == 4 * 2, "padding in address_index");
+  WIRE_DECLARE_OBJECT(address_index);
+
+  //! Maps a subaddress pubkey to its index values
+  struct subaddress_map
+  {
+    crypto::public_key subaddress; //!< Must be first for LMDB optimzations
+    address_index index;
+  };
+  static_assert(sizeof(subaddress_map) == 32 + 4 * 2, "padding in subaddress_map");
+  WIRE_DECLARE_OBJECT(subaddress_map);
+
   struct account
   {
     account_id id;          //!< Must be first for LMDB optimizations
@@ -121,10 +191,13 @@ namespace db
     account_time creation;  //!< Time account first appeared in database.
     account_flags flags;    //!< Additional account info bitmask.
     char reserved[3];
+    address_index lookahead;
+    block_id lookahead_fail;
   };
-  static_assert(sizeof(account) == (4 * 2) + 64 + 32 + (8 * 2) + (4 * 2), "padding in account");
+  static_assert(sizeof(account) == (4 * 2) + 64 + 32 + (8 * 2) + (4 * 2) + (4 * 2) + 8, "padding in account");
   void write_bytes(wire::writer&, const account&, bool show_key = false);
 
+  //! Used with quick and full sync mode
   struct block_info
   {
     block_id id;      //!< Must be first for LMDB optimizations
@@ -132,6 +205,36 @@ namespace db
   };
   static_assert(sizeof(block_info) == 8 + 32, "padding in block_info");
   WIRE_DECLARE_OBJECT(block_info);
+
+  struct block_difficulty
+  {
+    using unsigned_int = boost::multiprecision::uint128_t;
+
+    std::uint64_t high;
+    std::uint64_t low;
+
+    void set_difficulty(const unsigned_int& in);
+    unsigned_int get_difficulty() const;
+  };
+  static_assert(sizeof(block_difficulty) == 8 * 2, "padding in block_difficulty");
+  WIRE_DECLARE_OBJECT(block_difficulty);
+
+  //! Used with untrusted daemons / full sync mode
+  struct block_pow
+  {
+    block_id id;
+    std::uint64_t timestamp;
+    block_difficulty cumulative_diff; 
+  };
+  static_assert(sizeof(block_pow) == 8 * 4, "padding in blow_pow");
+  WIRE_DECLARE_OBJECT(block_pow);
+
+  //! Used during sync "check-ins" if --untrusted-daemon
+  struct pow_sync
+  {
+    std::uint64_t timestamp;
+    block_difficulty cumulative_diff;
+  };
 
   //! `output`s and `spend`s are sorted by these fields to make merging easier.
   struct transaction_link
@@ -192,28 +295,31 @@ namespace db
       crypto::hash8 short_;  //!< Decrypted short payment id
       crypto::hash long_;    //!< Long version of payment id (always decrypted)
     } payment_id;
+    std::uint64_t fee;       //!< Total fee for transaction
+    address_index recipient;
   };
   static_assert(
-    sizeof(output) == 8 + 32 + (8 * 3) + (4 * 2) + 32 + (8 * 2) + (32 * 3) + 7 + 1 + 32,
+    sizeof(output) == 8 + 32 + (8 * 3) + (4 * 2) + 32 + (8 * 2) + (32 * 3) + 7 + 1 + 32 + 8 + 2 * 4,
     "padding in output"
   );
-  void write_bytes(wire::writer&, const output&);
+  WIRE_DECLARE_OBJECT(output);
 
   //! Information about a possible spend of a received `output`.
   struct spend
   {
     transaction_link link;    //!< Orders and links `spend` to `output`.
     crypto::key_image image;  //!< Unique ID for the spend
-    // `link` and `image` must in this order for LMDB optimizations
     output_id source;         //!< The output being spent
+    // `link`, `image`, and `source` must in this order for LMDB optimizations
     std::uint64_t timestamp;  //!< Timestamp of spend
     std::uint64_t unlock_time;//!< Unlock time of spend
     std::uint32_t mixin_count;//!< Ring-size of TX output
     char reserved[3];
     std::uint8_t length;      //!< Length of `payment_id` field (0..32).
     crypto::hash payment_id;  //!< Unencrypted only, can't decrypt spend
+    address_index sender;
   };
-  static_assert(sizeof(spend) == 8 + 32 * 2 + 8 * 4 + 4 + 3 + 1 + 32, "padding in spend");
+  static_assert(sizeof(spend) == 8 + 32 * 2 + 8 * 4 + 4 + 3 + 1 + 32 + 2 * 4, "padding in spend");
   WIRE_DECLARE_OBJECT(spend);
 
   //! Key image and info needed to retrieve primary `spend` data.
@@ -233,9 +339,119 @@ namespace db
     account_time creation;        //!< Time the request was created.
     account_flags creation_flags; //!< Generated locally?
     char reserved[3];
+    address_index lookahead;      //!< Desired subaddress lookahead
   };
-  static_assert(sizeof(request_info) == 64 + 32 + 8 + (4 * 2), "padding in request_info");
+  static_assert(sizeof(request_info) == 64 + 32 + 8 + (4 * 2) + (4*2), "padding in request_info");
   void write_bytes(wire::writer& dest, const request_info& self, bool show_key = false);
+
+  enum class webhook_type : std::uint8_t
+  {
+    tx_confirmation = 0, // cannot change values - stored in DB
+    new_account,
+    tx_spend
+    // unconfirmed_tx,
+    // new_block
+    // confirmed_tx,
+    // double_spend_tx,
+    // tx_confidence
+  };
+  WIRE_DECLARE_ENUM(webhook_type);
+
+  //! Key for upcoming webhooks or in-progress webhooks
+  struct webhook_key
+  {
+    account_id user;
+    webhook_type type;
+    char reserved[3];
+  };
+  static_assert(sizeof(webhook_key) == 4 + 1 + 3, "padding in webhook_key");
+  WIRE_DECLARE_OBJECT(webhook_key);
+
+  //! Webhook values used to sort by duplicate keys
+  struct webhook_dupsort
+  {
+    std::uint64_t payment_id; //!< Only used with `tx_confirmation` type.
+    boost::uuids::uuid event_id;
+  };
+  static_assert(sizeof(webhook_dupsort) == 8 + 16, "padding in webhoook");
+
+  //! Variable length data for a webhook key/event
+  struct webhook_data
+  {
+    std::string url;
+    std::string token;
+    std::uint32_t confirmations;
+  };
+  WIRE_MSGPACK_DECLARE_OBJECT(webhook_data);
+
+  //! Compatible with lmdb::table code
+  using webhook_value = std::pair<webhook_dupsort, webhook_data>;
+  WIRE_DECLARE_OBJECT(webhook_value);
+
+  //! Returned by DB when a webhook event "tripped"
+  struct webhook_tx_confirmation
+  {
+    webhook_key key;
+    webhook_value value;
+    output tx_info;
+  };
+  WIRE_DECLARE_OBJECT(webhook_tx_confirmation);
+
+  //! Returned by DB when a webhook event "tripped"
+  struct webhook_tx_spend
+  {
+    webhook_key key;
+    webhook_value value;
+    struct tx_info_
+    {
+      spend input;
+      output::spend_meta_ source;
+    } tx_info;
+  };
+  void write_bytes(wire::writer&, const webhook_tx_spend&);
+
+  //! References a specific output that triggered a webhook
+  struct webhook_output
+  {
+    transaction_link tx;
+    output_id out;
+  };
+
+  //! References all info from a webhook that triggered
+  struct webhook_event
+  {
+    webhook_output link;
+    webhook_dupsort link_webhook;
+  };
+  void write_bytes(wire::json_writer&, const webhook_event&);
+
+  //! Returned by DB when a webhook event "tripped"
+  struct webhook_new_account
+  {
+    webhook_value value;
+    account_address account;
+  };
+  void write_bytes(wire::writer&, const webhook_new_account&);
+
+  inline constexpr bool operator==(address_index const& left, address_index const& right) noexcept
+  {
+    return left.maj_i == right.maj_i && left.min_i == right.min_i;
+  }
+  inline constexpr bool operator!=(address_index const& left, address_index const& right) noexcept
+  {
+    return left.maj_i != right.maj_i || left.min_i != right.min_i;
+  }
+
+  inline constexpr bool operator<(address_index const& left, address_index const& right) noexcept
+  {
+    return left.maj_i == right.maj_i ?
+      left.min_i < right.min_i : left.maj_i < right.maj_i;
+  }
+
+
+  bool operator==(transaction_link const& left, transaction_link const& right) noexcept;
+  bool operator<(transaction_link const& left, transaction_link const& right) noexcept;
+  bool operator<=(transaction_link const& left, transaction_link const& right) noexcept;
 
   inline constexpr bool operator==(output_id left, output_id right) noexcept
   {
@@ -255,9 +471,28 @@ namespace db
     return left.high == right.high ?
       left.low <= right.low : left.high < right.high;
   }
+  inline constexpr bool operator<(const webhook_key& left, const webhook_key& right) noexcept
+  {
+    return left.user == right.user ?
+      left.type < right.type : left.user < right.user;
+  }
 
-  bool operator<(transaction_link const& left, transaction_link const& right) noexcept;
-  bool operator<=(transaction_link const& left, transaction_link const& right) noexcept;
+  bool operator<(const webhook_dupsort& left, const webhook_dupsort& right) noexcept;
+
+  inline bool operator==(const webhook_output& left, const webhook_output& right) noexcept
+  {
+    return left.out == right.out && left.tx == right.tx;
+  }
+  inline bool operator<(const webhook_output& left, const webhook_output& right) noexcept
+  {
+    return left.tx == right.tx ? left.out < right.out : left.tx < right.tx;
+  }
+  inline bool operator<(const webhook_event& left, const webhook_event& right) noexcept
+  {
+    return left.link == right.link ?
+      left.link_webhook < right.link_webhook : left.link < right.link;
+  }
+
 
   /*!
     Write `address` to `out` in base58 format using `lws::config::network` to

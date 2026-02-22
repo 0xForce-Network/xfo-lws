@@ -27,9 +27,10 @@
 
 #pragma once
 
-#include <boost/asio/io_service.hpp>
-#include <cstddef>
+#include <boost/thread/thread.hpp>
+#include <cstdint>
 #include <list>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -40,29 +41,41 @@
 
 namespace lws
 {
+  struct rest_server_data;
   class rest_server
   {
     struct internal;
-    
-    boost::asio::io_service io_service_;
+    template<typename> struct connection;
+    template<typename> struct handler_loop;
+    template<typename> struct accept_loop;
+
+    std::unique_ptr<rest_server_data> global_;
     std::list<internal> ports_;
-    
+    std::vector<boost::thread> workers_;
+
+    void run_io();
+
   public:
     struct configuration
     {
       epee::net_utils::ssl_authentication_t auth;
       std::vector<std::string> access_controls;
       std::size_t threads;
+      std::uint32_t max_subaddresses;
+      epee::net_utils::ssl_verification_t webhook_verify;
       bool allow_external;
+      bool disable_admin_auth;
+      bool auto_accept_creation;
+      bool auto_accept_import;
     };
-    
-    explicit rest_server(epee::span<const std::string> addresses, db::storage disk, rpc::client client, configuration config);
-    
+
+    explicit rest_server(epee::span<const std::string> addresses, std::vector<std::string> admin, db::storage disk, rpc::client client, configuration config);
+
     rest_server(rest_server&&) = delete;
     rest_server(rest_server const&) = delete;
-    
+
     ~rest_server() noexcept;
-    
+
     rest_server& operator=(rest_server&&) = delete;
     rest_server& operator=(rest_server const&) = delete;
   };

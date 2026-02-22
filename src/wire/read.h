@@ -1,4 +1,4 @@
-// Copyright (c) 2020, The Monero Project
+// Copyright (c) 2020-2023, The Monero Project
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without modification, are
@@ -44,18 +44,26 @@ namespace wire
 {
   //! Interface for converting "wire" (byte) formats to C/C++ objects without a DOM.
   class reader
-  {
+  { 
     std::size_t depth_; //!< Tracks number of recursive objects and arrays
 
   protected:
-    //! \throw wire::exception if max depth is reached
-    void increment_depth();
-    void decrement_depth() noexcept { --depth_; }
+    epee::span<const std::uint8_t> remaining_; //!< Derived class tracks unprocessed bytes here
+
+    reader(const epee::span<const std::uint8_t> remaining) noexcept
+      : depth_(0), remaining_(remaining)
+    {}
 
     reader(const reader&) = default;
     reader(reader&&) = default;
     reader& operator=(const reader&) = default;
     reader& operator=(reader&&) = default;
+
+    //! \throw wire::exception if max depth is reached
+    void increment_depth();
+
+    //! \throw std::logic_error if already `depth() == 0`.
+    void decrement_depth();
 
   public:
     struct key_map
@@ -67,15 +75,17 @@ namespace wire
     //! \return Maximum read depth for both objects and arrays before erroring
     static constexpr std::size_t max_read_depth() noexcept { return 100; }
 
-    reader() noexcept
-      : depth_(0)
-    {}
+    //! \return Assume delimited arrays in generic interface (some optimizations disabled)
+    static constexpr std::true_type delimited_arrays() noexcept { return {}; }
 
     virtual ~reader() noexcept
     {}
 
     //! \return Number of recursive objects and arrays
     std::size_t depth() const noexcept { return depth_; }
+
+    //! \return Unprocessed bytes
+    epee::span<const std::uint8_t> remaining() const noexcept { return remaining_; }
 
     //! \throw wire::exception if parsing is incomplete.
     virtual void check_complete() const = 0;
@@ -101,17 +111,20 @@ namespace wire
     //! \throw wire::exception if next value cannot be read as binary into `dest`.
     virtual void binary(epee::span<std::uint8_t> dest) = 0;
 
-    //! \throw wire::exception if next value invalid enum. \return Index in `enums`.
-    virtual std::size_t enumeration(epee::span<char const* const> enums) = 0;
-
-    //! \throw wire::exception if next value not array
-    virtual std::size_t start_array() = 0;
+    /*  \param min_element_size of each array element in any format - if known.
+          Derived types with explicit element count should verify available
+          space, and throw a `wire::exception` on issues.
+        \throw wire::exception if next value not array
+        \throw wire::exception if not enough bytes for all array elements
+          (with epee/msgpack which has specified number of elements).
+        \return Number of values to read before calling `is_array_end()` */
+    virtual std::size_t start_array(std::size_t min_element_size) = 0;
 
     //! \return True if there is another element to read.
     virtual bool is_array_end(std::size_t count) = 0;
 
     //! \throw wire::exception if array end delimiter not present.
-    void end_array() noexcept { decrement_depth(); }
+    void end_array() { decrement_depth(); }
 
 
     //! \throw wire::exception if not object begin. \return State to be given to `key(...)` function.
@@ -134,35 +147,33 @@ namespace wire
      */
     virtual bool key(epee::span<const key_map> map, std::size_t& state, std::size_t& index) = 0;
 
-    void end_object() noexcept { decrement_depth(); }
+    void end_object() { decrement_depth(); }
   };
 
-  inline void read_bytes(reader& source, bool& dest)
-  {
-    dest = source.boolean();
-  }
+  template<typename R>
+  inline void read_bytes(R& source, bool& dest)
+  { dest = source.boolean(); }
 
-  inline void read_bytes(reader& source, double& dest)
-  {
-    dest = source.real();
-  }
+  template<typename R>
+  inline void read_bytes(R& source, double& dest)
+  { dest = source.real(); }
 
-  inline void read_bytes(reader& source, std::string& dest)
-  {
-    dest = source.string();
-  }
+  template<typename R>
+  inline void read_bytes(R& source, std::string& dest)
+  { dest = source.string(); }
 
   template<typename R>
   inline void read_bytes(R& source, std::vector<std::uint8_t>& dest)
-  {
-    dest = source.binary();
-  }
+  { dest = source.binary(); }
 
-  template<typename T>
-  inline enable_if<is_blob<T>::value> read_bytes(reader& source, T& dest)
-  {
-    source.binary(epee::as_mut_byte_span(dest));
-  }
+  template<typename R, typename T>
+  inline std::enable_if_t<is_blob<T>::value> read_bytes(R& source, T& dest)
+  { source.binary(epee::as_mut_byte_span(dest)); }
+
+  //! Use `read_bytes(...)` method if available for `T`.
+  template<typename R, typename T>
+  inline auto read_bytes(R& source, T& dest) -> decltype(dest.read_bytes(source))
+  { return dest.read_bytes(source); }
 
   namespace integer
   {
@@ -205,17 +216,17 @@ namespace wire
   }
 
   //! read all current and future signed integer types
-  template<typename T>
-  inline enable_if<std::is_signed<T>::value && std::is_integral<T>::value>
-  read_bytes(reader& source, T& dest)
+  template<typename R, typename T>
+  inline std::enable_if_t<std::is_signed<T>::value && std::is_integral<T>::value>
+  read_bytes(R& source, T& dest)
   {
     dest = integer::cast_signed<T>(source.integer());
   }
 
   //! read all current and future unsigned integer types
-  template<typename T>
-  inline enable_if<std::is_unsigned<T>::value && std::is_integral<T>::value>
-  read_bytes(reader& source, T& dest)
+  template<typename R, typename T>
+  inline std::enable_if_t<std::is_unsigned<T>::value && std::is_integral<T>::value>
+  read_bytes(R& source, T& dest)
   {
     dest = integer::cast_unsigned<T>(source.unsigned_integer());
   }
@@ -231,105 +242,135 @@ namespace wire_read
 
   [[noreturn]] void throw_exception(wire::error::schema code, const char* display, epee::span<char const* const> name_list);
 
+  template<typename R, typename T>
+  inline void bytes(R& source, T&& dest)
+  {
+    read_bytes(source, dest); // ADL (searches every associated namespace)
+  }
+
   //! \return `T` converted from `source` or error.
-  template<typename T, typename R>
-  inline expect<T> to(R& source)
+  template<typename R, typename T, typename U>
+  inline std::error_code from_bytes(T&& source, U& dest)
   {
     try
     {
-      T dest{};
-      read_bytes(source, dest);
-      source.check_complete();
-      return dest;
+      R in{std::forward<T>(source)};
+      bytes(in, dest);
+      in.check_complete();
     }
     catch (const wire::exception& e)
     {
       return e.code();
     }
+    return {};
   }
 
+  // Trap objects that do not have standard insertion functions
+  template<typename R, typename... T>
+  void array_insert(const R&, const T&...) noexcept
+  {
+    static_assert(std::is_same<R, void>::value, "type T does not have a valid insertion function");
+  }
+
+  // Insert to sorted containers
+  template<typename R, typename T, typename V = typename T::value_type>
+  inline auto array_insert(R& source, T& dest) -> decltype(dest.emplace_hint(dest.end(), std::declval<V>()), bool(true))
+  {
+    V val{};
+    wire_read::bytes(source, val);
+    dest.emplace_hint(dest.end(), std::move(val));
+    return true;
+  }
+
+  // Insert into unsorted containers
+  template<typename R, typename T, typename V = typename T::value_type>
+  inline auto array_insert(R& source, T& dest) -> decltype(dest.emplace_back(), dest.back(), bool(true))
+  {
+    // more efficient to process the object in-place in many cases
+    dest.emplace_back();
+    wire_read::bytes(source, dest.back());
+    return true;
+  }
+
+  // no compile-time checks for the array constraints
   template<typename R, typename T>
-  inline void array(R& source, T& dest)
+  inline void array_unchecked(R& source, T& dest, const std::size_t min_element_size, const std::size_t max_element_count)
   {
     using value_type = typename T::value_type;
-    static_assert(!std::is_same<value_type, char>::value, "read array of chars as binary");
+    static_assert(!std::is_same<value_type, char>::value, "read array of chars as string");
+    static_assert(!std::is_same<value_type, std::int8_t>::value, "read array of signed chars as binary");
     static_assert(!std::is_same<value_type, std::uint8_t>::value, "read array of unsigned chars as binary");
 
-    std::size_t count = source.start_array();
+    std::size_t count = source.start_array(min_element_size);
+
+    // quick check for epee/msgpack formats
+    if (max_element_count < count)
+      throw_exception(wire::error::schema::array_max_element, "", nullptr);
+
+    // also checked by derived formats when count is known
+    if (min_element_size && (source.remaining().size() / min_element_size) < count)
+      throw_exception(wire::error::schema::array_min_size, "", nullptr);
 
     dest.clear();
-    dest.reserve(count);
+    wire::reserve(dest, count);
 
     bool more = count;
+    const std::size_t start_bytes = source.remaining().size();
     while (more || !source.is_array_end(count))
     {
-      dest.emplace_back();
-      read_bytes(source, dest.back());
+      // check for json/cbor formats
+      if (source.delimited_arrays() && max_element_count <= dest.size())
+        throw_exception(wire::error::schema::array_max_element, "", nullptr);
+
+      wire_read::array_insert(source, dest);
       --count;
       more &= bool(count);
+
+      if (((start_bytes - source.remaining().size()) / dest.size()) < min_element_size)
+        throw_exception(wire::error::schema::array_min_size, "", nullptr);
     }
 
-    return source.end_array();
+    source.end_array();
   }
 
-  // `unpack_variant_field` identifies which of the variant types was selected. starts with index-0
-
-  template<typename R, typename T>
-  inline void unpack_variant_field(std::size_t, R&, const T&)
-  {}
-
-  template<typename R, typename T, typename U, typename... X>
-  inline void unpack_variant_field(const std::size_t index, R& source, T& variant, const wire::option<U>& head, const wire::option<X>&... tail)
+  template<typename R, typename T, std::size_t M, std::size_t N = std::numeric_limits<std::size_t>::max()>
+  inline void array(R& source, T& dest, wire::min_element_size<M> min_element_size, wire::max_element_count<N> max_element_count = {})
   {
-    if (index)
-      unpack_variant_field(index - 1, source, variant, tail...);
-    else
-    {
-      U dest{};
-      read_bytes(source, dest);
-      variant = std::move(dest);
-    }
+    using value_type = typename T::value_type;
+    static_assert(
+      min_element_size.template check<value_type>() || max_element_count.template check<value_type>(),
+      "array unpacking memory issues"
+    );
+    // each set of template args generates unique ASM, merge them down
+    array_unchecked(source, dest, min_element_size, max_element_count);
   }
 
-  // `unpack_field` expands `variant_field_`s or reads `field_`s directly
-
-  template<typename R, typename T, bool Required, typename... U>
-  inline void unpack_field(const std::size_t index, R& source, wire::variant_field_<T, Required, U...>& dest)
+  template<typename T, unsigned I>
+  inline void reset_field(wire::field_<T, true, I>& dest)
   {
-    unpack_variant_field(index, source, dest.get_value(), static_cast< const wire::option<U>& >(dest)...);
+    // array fields are always optional, see `wire/field.h`
+    if (dest.optional_on_empty())
+      wire::clear(dest.get_value());
   }
 
-  template<typename R, typename T>
-  inline void unpack_field(std::size_t, R& source, wire::field_<T, true>& dest)
+  template<typename T, unsigned I>
+  inline void reset_field(wire::field_<T, false, I>& dest)
   {
-    read_bytes(source, dest.get_value());
+    dest.get_value().reset();
   }
 
-  template<typename R, typename T>
-  inline void unpack_field(std::size_t, R& source, wire::field_<T, false>& dest)
+  template<typename R, typename T, unsigned I>
+  inline void unpack_field(std::size_t, R& source, wire::field_<T, true, I>& dest)
   {
-    dest.get_value().emplace();
-    read_bytes(source, *dest.get_value());
+    bytes(source, dest.get_value());
   }
 
-  // `expand_field_map` writes a single `field_` name or all option names in a `variant_field_` to a table
-
-  template<std::size_t N>
-  inline void expand_field_map(std::size_t, wire::reader::key_map (&)[N])
-  {}
-
-  template<std::size_t N, typename T, typename... U>
-  inline void expand_field_map(std::size_t index, wire::reader::key_map (&map)[N], const T& head, const U&... tail)
+  template<typename R, typename T, unsigned I>
+  inline void unpack_field(std::size_t, R& source, wire::field_<T, false, I>& dest)
   {
-    map[index].name = head.name;
-    map[index].id = 0;
-    expand_field_map(index + 1, map, tail...);
-  }
-
-  template<std::size_t N, typename T, bool Required, typename... U>
-  inline void expand_field_map(std::size_t index, wire::reader::key_map (&map)[N], const wire::variant_field_<T, Required, U...>& field)
-  {
-    expand_field_map(index, map, static_cast< const wire::option<U> & >(field)...);
+    if (!bool(dest.get_value()))
+      dest.get_value().emplace();
+    bytes(source, *dest.get_value());
   }
 
   //! Tracks read status of every object field instance.
@@ -360,7 +401,8 @@ namespace wire_read
     std::size_t set_mapping(std::size_t index, wire::reader::key_map (&map)[N])
     {
       our_index_ = index;
-      expand_field_map(index, map, field_); // expands possible inner options
+      map[index].id = field_.id();
+      map[index].name = field_.name;
       return index + count();
     }
 
@@ -376,6 +418,14 @@ namespace wire_read
       unpack_field(index - our_index_, source, field_);
       read_ = true;
       return 1 + is_required();
+    }
+
+    //! Reset optional fields that were skipped
+    bool reset_omitted()
+    {
+      if (!is_required() && !read_)
+        reset_field(field_);
+      return true;
     }
   };
 
@@ -427,25 +477,28 @@ namespace wire_read
       throw_exception(wire::error::schema::missing_key, "", missing);
     }
 
+    wire::sum(fields.reset_omitted()...);
     source.end_object();
   }
 } // wire_read
 
 namespace wire
 {
-  template<typename T>
-  inline void array(reader& source, T& dest)
-  {
-    wire_read::array(source, dest);
-  }
   template<typename R, typename T>
-  inline enable_if<is_array<T>::value> read_bytes(R& source, T& dest)
+  inline std::enable_if_t<is_array<T>::value> read_bytes(R& source, T& dest)
   {
-    wire_read::array(source, dest);
+    static constexpr const std::size_t wire_size =
+      default_min_element_size<R, typename T::value_type>::value;
+    static_assert(
+      wire_size != 0,
+      "no sane default array constraints for the reader / value_type pair"
+    );
+
+    wire_read::array(source, dest, min_element_size<wire_size>{});
   }
 
-  template<typename... T>
-  inline void object(reader& source, T... fields)
+  template<typename R, typename... T>
+  inline std::enable_if_t<std::is_base_of<reader, R>::value> object(R& source, T... fields)
   {
     wire_read::object(source, wire_read::tracker<T>{std::move(fields)}...);
   }

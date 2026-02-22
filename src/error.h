@@ -42,6 +42,10 @@ namespace lws
     bad_blockchain,             //!< Blockchain is invalid or wrong network type
     bad_client_tx,              //!< REST client submitted invalid transaction
     bad_daemon_response,        //!< RPC Response from daemon was invalid
+    bad_height,                 //!< Invalid blockchain height
+    bad_url,                    //!< Invalid URL
+    bad_verb,                   //!< Bad HTTP verb for endpoint
+    bad_webhook,                //!< Invalid webhook request
     blockchain_reorg,           //!< Blockchain reorg after fetching/scanning block(s)
     configuration,              //!< Process configuration invalid
     crypto_failure,             //!< Cryptographic function failed
@@ -54,11 +58,16 @@ namespace lws
     exchange_rates_fetch,       //!< Exchange rates fetching failed
     exchange_rates_old,         //!< Exchange rates are older than cache interval
     http_server,                //!< HTTP server failure (init or run)
+    invalid_range,              //!< Invalid subaddress range provided
+    json_rpc,                   //!< Error returned by JSON-RPC server
+    max_subaddresses,           //!< Max subaddresses exceeded
     not_enough_mixin,           //!< Not enough outputs to meet mixin count
+    not_enough_amount,          //!< Not enough outputs to meet amount
     signal_abort_process,       //!< In process ZMQ PUB to abort the process was received
     signal_abort_scan,          //!< In process ZMQ PUB to abort the scan was received
     signal_unknown,             //!< An unknown in process ZMQ PUB was received
     system_clock_invalid_range, //!< System clock is out of range for storage format
+    rmq_failure,                //!< Error within RMQ library
     tx_relay_failed             //!< Daemon failed to relayed tx from REST client
   };
 

@@ -28,50 +28,109 @@
 
 include_directories(.)
 
+find_package(Git)
+
+set(MLWS_COMMIT_BRANCH "")
+set(MLWS_COMMIT_DATE "")
+set(MLWS_COMMIT_HASH "")
+if (GIT_FOUND)
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE MLWS_COMMIT_HASH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" rev-parse --abbrev-ref HEAD
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE MLWS_COMMIT_BRANCH
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+  execute_process(
+    COMMAND "${GIT_EXECUTABLE}" log -1 "--date=format:\"%Y/%m/%d %T\"" "--format=\"%ad\""
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    OUTPUT_VARIABLE MLWS_COMMIT_DATE
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+endif ()
+
+configure_file(lws_version.h.in "${CMAKE_BINARY_DIR}/generated_include/lws_version.h")
+include_directories("${CMAKE_BINARY_DIR}/generated_include")
+
+add_subdirectory(lmdb)
+add_subdirectory(wire)
 add_subdirectory(db)
+add_subdirectory(net)
 add_subdirectory(rpc)
 add_subdirectory(util)
-add_subdirectory(wire)
 
 # For both the server and admin utility.
-set(monero-lws-common_sources config.cpp error.cpp)
-set(monero-lws-common_headers config.h error.h fwd.h)
+set(xfo-lws-common_sources config.cpp error.cpp)
+set(xfo-lws-common_headers config.h error.h fwd.h)
 
-add_library(monero-lws-common ${monero-lws-common_sources} ${monero-lws-common_headers})
-target_link_libraries(monero-lws-common monero::libraries)
+add_library(xfo-lws-common ${xfo-lws-common_sources} ${xfo-lws-common_headers})
+target_link_libraries(xfo-lws-common monero::libraries)
 
-
-add_executable(monero-lws-daemon server_main.cpp rest_server.cpp scanner.cpp)
-target_include_directories(monero-lws-daemon PUBLIC ${ZMQ_INCLUDE_PATH})
-target_link_libraries(monero-lws-daemon
-  PRIVATE
+add_library(xfo-lws-daemon-common rest_server.cpp scanner.cpp)
+target_include_directories(xfo-lws-daemon-common PUBLIC ${ZMQ_INCLUDE_PATH})
+target_link_libraries(xfo-lws-daemon-common
+  PUBLIC
     monero::libraries
     ${MONERO_lmdb}
-    monero-lws-common
-    monero-lws-db
-    monero-lws-rpc
-    monero-lws-util
-    monero-lws-wire-json
+    xfo-lws-common
+    xfo-lws-db
+    xfo-lws-net
+    xfo-lws-rpc
+    xfo-lws-rpc-scanner
+    xfo-lws-wire-json
+    xfo-lws-util
     ${Boost_CHRONO_LIBRARY}
+    ${Boost_COROUTINE_LIBRARY}
+    ${Boost_CONTEXT_LIBRARY}
     ${Boost_PROGRAM_OPTIONS_LIBRARY}
-    ${Boost_FILESYSTEM_LIBRARY}
+    ${Boost_SYSTEM_LIBRARY}
     ${Boost_THREAD_LIBRARY}
-    ${CMAKE_THREAD_LIBS_INIT}
+    ${Boost_THREAD_LIBS_INIT}
     ${EXTRA_LIBRARIES}
     ${ZMQ_LIB}
+    ${SODIUM_LIBRARY}
     Threads::Threads
 )
 
-add_executable(monero-lws-admin admin_main.cpp)
-target_link_libraries(monero-lws-admin
+add_executable(xfo-lws-daemon server_main.cpp)
+target_link_libraries(xfo-lws-daemon
   PRIVATE
     monero::libraries
-    monero-lws-common
-    monero-lws-db
-    monero-lws-wire-json
+    xfo-lws-daemon-common
+    xfo-lws-rpc-scanner
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
+    ${Boost_FILESYSTEM_LIBRARY}
+)
+
+add_executable(xfo-lws-admin admin_main.cpp)
+target_link_libraries(xfo-lws-admin
+  PRIVATE
+    monero::libraries
+    xfo-lws-common
+    xfo-lws-db
+    xfo-lws-rpc
+    xfo-lws-wire-json
     ${Boost_PROGRAM_OPTIONS_LIBRARY}
     Threads::Threads
 )
 
-install(TARGETS monero-lws-daemon DESTINATION bin)
-install(TARGETS monero-lws-admin DESTINATION bin)
+add_executable(xfo-lws-client client_main.cpp)
+target_link_libraries(xfo-lws-client
+  PRIVATE
+    monero::libraries
+    xfo-lws-common
+    xfo-lws-daemon-common
+    xfo-lws-rpc
+    xfo-lws-rpc-scanner
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
+    Threads::Threads
+)
+
+install(TARGETS xfo-lws-daemon DESTINATION bin)
+install(TARGETS xfo-lws-admin DESTINATION bin)
+install(TARGETS xfo-lws-client DESTINATION bin)

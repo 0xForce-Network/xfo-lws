@@ -26,9 +26,9 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-set(monero-lws-db_sources account.cpp data.cpp storage.cpp string.cpp)
-set(monero-lws-db_headers account.h data.h fwd.h storage.h string.h)
+set(xfo-lws-db_sources account.cpp data.cpp storage.cpp string.cpp)
+set(xfo-lws-db_headers account.h data.h fwd.h storage.h string.h)
 
-add_library(monero-lws-db ${monero-lws-db_sources} ${monero-lws-db_headers})
-target_include_directories(monero-lws-db PUBLIC "${LMDB_INCLUDE}")
-target_link_libraries(monero-lws-db monero::libraries ${LMDB_LIB_PATH})
+add_library(xfo-lws-db ${xfo-lws-db_sources} ${xfo-lws-db_headers})
+target_include_directories(xfo-lws-db PUBLIC "${LMDB_INCLUDE}")
+target_link_libraries(xfo-lws-db monero::libraries xfo-lws-common xfo-lws-lmdb xfo-lws-wire-msgpack ${LMDB_LIB_PATH})

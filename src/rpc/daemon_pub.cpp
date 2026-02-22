@@ -27,24 +27,31 @@
 
 #include "daemon_pub.h"
 
-#include "wire/crypto.h"
+#include "cryptonote_basic/cryptonote_basic.h" // monero/src
+#include "rpc/daemon_zmq.h"
+#include "wire/adapted/crypto.h"
 #include "wire/error.h"
 #include "wire/field.h"
 #include "wire/traits.h"
 #include "wire/json/read.h"
+#include "wire/wrapper/array.h"
+#include "wire/wrappers_impl.h"
 
 namespace
 {
+  using max_txes_pub = wire::max_element_count<775>;
+
   struct dummy_chain_array
   {
     using value_type = crypto::hash;
 
-    std::uint64_t count;
+    std::size_t count = 0;
     std::reference_wrapper<crypto::hash> id;
 
     void clear() noexcept {}
     void reserve(std::size_t) noexcept {}
 
+    std::size_t size() const noexcept { return count; }
     crypto::hash& back() noexcept { return id; }
     void emplace_back() { ++count; }
   };
@@ -77,7 +84,25 @@ namespace rpc
 
   expect<minimal_chain_pub> minimal_chain_pub::from_json(std::string&& source)
   {
-    return wire::json::from_bytes<minimal_chain_pub>(std::move(source));
+    minimal_chain_pub out{};
+    std::error_code err = wire::json::from_bytes(std::move(source), out);
+    if (err)
+      return err;
+    return {std::move(out)};
+  }
+
+  static void read_bytes(wire::json_reader& source, full_txpool_pub& self)
+  {
+    wire_read::bytes(source, wire::array<max_txes_pub>(std::ref(self.txes)));
+  }
+
+  expect<full_txpool_pub> full_txpool_pub::from_json(std::string&& source)
+  {
+    full_txpool_pub out{};
+    std::error_code err = wire::json::from_bytes(std::move(source), out);
+    if (err)
+      return err;
+    return {std::move(out)};
   }
 }
 }

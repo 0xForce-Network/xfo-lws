@@ -60,15 +60,15 @@ namespace wire
     void check_flush();
 
   protected:
-    json_writer(bool needs_flush)
-      : writer(), bytes_(), formatter_(bytes_), needs_flush_(needs_flush)
+    json_writer(epee::byte_stream&& out, bool needs_flush)
+      : writer(), bytes_(std::move(out)), formatter_(bytes_), needs_flush_(needs_flush)
     {}
 
     //! \throw std::logic_error if incomplete JSON tree
     void check_complete();
 
     //! \throw std::logic_error if incomplete JSON tree. \return JSON bytes
-    epee::byte_slice take_json();
+    epee::byte_stream take_json();
 
     //! Flush bytes in local buffer to `do_flush(...)`
     void flush()
@@ -78,6 +78,9 @@ namespace wire
     }
 
   public:
+    //! JSON does not need array sizes.
+    static constexpr std::false_type need_array_size() noexcept { return{}; }
+
     json_writer(const json_writer&) = delete;
     virtual ~json_writer() noexcept;
     json_writer& operator=(const json_writer&) = delete;
@@ -98,8 +101,6 @@ namespace wire
     void string(boost::string_ref) override final;
     void binary(epee::span<const std::uint8_t> source) override final;
 
-    void enumeration(std::size_t index, epee::span<char const* const> enums) override final;
-
     void start_array(std::size_t) override final;
     void end_array() override final;
 
@@ -113,12 +114,18 @@ namespace wire
   //! Buffers entire JSON message in memory
   struct json_slice_writer final : json_writer
   {
+    using sink = epee::byte_stream;
+
+    explicit json_slice_writer(sink&& out)
+      : json_writer(std::move(out), false)
+    {}
+
     explicit json_slice_writer()
-      : json_writer(false)
+      : json_writer(epee::byte_stream{}, false)
     {}
 
     //! \throw std::logic_error if incomplete JSON tree \return JSON bytes
-    epee::byte_slice take_bytes()
+    epee::byte_stream take_sink()
     {
       return json_writer::take_json();
     }
@@ -132,7 +139,7 @@ namespace wire
     virtual void do_flush(epee::span<const std::uint8_t>) override final;
   public:
     explicit json_stream_writer(std::ostream& dest)
-      : json_writer(true), dest(dest)
+      : json_writer(epee::byte_stream{}, true), dest(dest)
     {}
 
     //! Flush remaining bytes to stream \throw std::logic_error if incomplete JSON tree
@@ -142,45 +149,4 @@ namespace wire
       flush();
     }
   };
-
-  template<typename T>
-  epee::byte_slice json::to_bytes(const T& source)
-  {
-    return wire_write::to_bytes<json_slice_writer>(source);
-  }
-
-  template<typename T, typename F = identity_>
-  inline void array(json_writer& dest, const T& source, F filter = F{})
-  {
-    // works with "lazily" computed ranges
-    wire_write::array(dest, source, 0, std::move(filter));
-  }
-  template<typename T, typename F>
-  inline void write_bytes(json_writer& dest, as_array_<T, F> source)
-  {
-    wire::array(dest, source.get_value(), std::move(source.filter));
-  }
-  template<typename T>
-  inline enable_if<is_array<T>::value> write_bytes(json_writer& dest, const T& source)
-  {
-    wire::array(dest, source);
-  }
-
-  template<typename T, typename F = identity_, typename G = identity_>
-  inline void dynamic_object(json_writer& dest, const T& source, F key_filter = F{}, G value_filter = G{})
-  {
-    // works with "lazily" computed ranges
-    wire_write::dynamic_object(dest, source, 0, std::move(key_filter), std::move(value_filter));
-  }
-  template<typename T, typename F, typename G>
-  inline void write_bytes(json_writer& dest, as_object_<T, F, G> source)
-  {
-    wire::dynamic_object(dest, source.get_map(), std::move(source.key_filter), std::move(source.value_filter));
-  }
-
-  template<typename... T>
-  inline void object(json_writer& dest, T... fields)
-  {
-    wire_write::object(dest, std::move(fields)...);
-  }
 }

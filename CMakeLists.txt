@@ -26,12 +26,52 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-cmake_minimum_required(VERSION 3.1.0)
-project(monero-lws)
+cmake_minimum_required(VERSION 3.5.0)
+project(xfo-lws)
 
 enable_language(CXX)
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+add_definitions(-DBOOST_UUID_DISABLE_ALIGNMENT) # This restores UUID's std::has_unique_object_representations property
+
+option(BUILD_TESTS "Build Tests" OFF)
+option(WITH_RMQ "Build with RMQ publish support" OFF)
+if (WITH_RMQ)
+  set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DMLWS_RMQ_ENABLED")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DMLWS_RMQ_ENABLED")
+endif()
+
+# If `MONERO_BUILD_DIR` is not specified, monero unit tests will be built with this hack
+set (LWS_BUILD_TESTS "${BUILD_TESTS}")
+set (BUILD_TESTS "Off")
+
+option(SANITIZER "Use specific sanitizer" OFF)
+if(NOT SANITIZER STREQUAL "OFF")
+  if (MSVC)
+    message(FATAL_ERROR "Cannot sanitize with MSVC")
+  else()
+    message(STATUS "Using sanitizer=${SANITIZER}")
+    add_compile_options("-fsanitize=${SANITIZER}")
+    add_link_options("-fsanitize=${SANITIZER}")
+  endif()
+endif()
+
+if (NOT MONERO_SOURCE_DIR)
+  set(MONERO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../monero" CACHE PATH "Location of xfo-core (monero) source tree")
+endif()
+get_filename_component(MONERO_SOURCE_DIR "${MONERO_SOURCE_DIR}" REALPATH)
+
+if (NOT MONERO_BUILD_DIR)
+  set(MONERO_BUILD_DIR "${MONERO_SOURCE_DIR}/build/release" CACHE PATH "Location of xfo-core (monero) build tree")
+endif()
+
+if(STATIC)
+  if(MSVC)
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .lib .dll.a .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+  else()
+    set(CMAKE_FIND_LIBRARY_SUFFIXES .a ${CMAKE_FIND_LIBRARY_SUFFIXES})
+  endif()
+endif()
 
 set(MONERO_LIBRARIES
   daemon_messages
@@ -56,67 +96,120 @@ set(MONERO_LIBRARIES
   easylogging
   version
   wallet-crypto
-  unbound
 )
 
-set(MONERO_OPTIONAL unbound wallet-crypto)
+set(MONERO_OPTIONAL wallet-crypto)
 
-set(MONERO_SEARCH_PATHS
-  "/contrib/epee/src"
-  "/external/db_drivers/liblmdb"
-  "/external/easylogging++"
-  "/src"
-  "/src/crypto"
-  "/src/crypto/wallet"
-  "/src/cryptonote_basic"
-  "/src/lmdb"
-  "/src/ringct"
-  "/src/rpc"
-)
+if (MONERO_BUILD_DIR)
 
+  set(MONERO_SEARCH_PATHS
+    "/contrib/epee/src"
+    "/external/db_drivers/liblmdb"
+    "/external/easylogging++"
+    "/src"
+    "/src/crypto"
+    "/src/crypto/wallet"
+    "/src/cryptonote_basic"
+    "/src/lmdb"
+    "/src/ringct"
+    "/src/rpc"
+  )
+
+
+  #
+  # Pull some information from monero build
+  #
+
+  # monero `master` and `release-v0.18` branches use different LIBSODIUM
+  # find routines. So the upstream cmake names differ
+
+  load_cache(${MONERO_BUILD_DIR} READ_WITH_PREFIX monero_
+    Boost_THREAD_LIBRARY_RELEASE
+    CMAKE_CXX_COMPILER
+    EXTRA_LIBRARIES
+    LIBUDEV_LIBRARY
+    usb_LIBRARY
+    HIDAPI_INCLUDE_DIR
+    HIDAPI_LIBRARY
+    libzmq_INCLUDE_DIRS
+    LMDB_INCLUDE
+    monero_SOURCE_DIR
+    OPENSSL_INCLUDE_DIR
+    OPENSSL_CRYPTO_LIBRARY
+    OPENSSL_SSL_LIBRARY
+    pkgcfg_lib_libzmq_zmq
+    sodium_LIBRARY_RELEASE
+    SODIUM_LIBRARY
+    UNBOUND_LIBRARIES
+    PGM_LIBRARY
+    NORM_LIBRARY
+    GSSAPI_LIBRARY
+    PROTOLIB_LIBRARY
+    ZMQ_INCLUDE_PATH
+    ZMQ_LIB
+  )
+
+  if (NOT (monero_monero_SOURCE_DIR STREQUAL "${MONERO_SOURCE_DIR}/src/cryptonote_protocol"))
+    message(FATAL_ERROR "Invalid Monero source dir - does not appear to match source used for build directory")
+  endif()
+
+  if (NOT (CMAKE_CXX_COMPILER STREQUAL monero_CMAKE_CXX_COMPILER))
+    message(FATAL_ERROR "Compiler for monero build differs from this project")
+  endif()
+
+  if ("${monero_UNBOUND_LIBRARIES}" STREQUAL "UNBOUND_LIBRARIES-NOTFOUND")
+    unset(monero_UNBOUND_LIBRARIES)
+  endif()
+
+  if ("${monero_HIDAPI_LIBRARY}" STREQUAL "HIDAPI_LIBRARY-NOTFOUND")
+    unset(monero_HIDAPI_INCLUDE_DIR)
+    unset(monero_HIDAPI_LIBRARY)
+  endif()
+
+  foreach (LIB ${MONERO_LIBRARIES})
+    find_library(LIB_PATH NAMES "${LIB}" PATHS ${MONERO_BUILD_DIR} PATH_SUFFIXES "/src/${LIB}" "external/${LIB}" ${MONERO_SEARCH_PATHS} NO_DEFAULT_PATH)
+
+    list(FIND MONERO_OPTIONAL "${LIB}" LIB_OPTIONAL)
+    if (NOT LIB_PATH)
+      if (LIB_OPTIONAL EQUAL -1)
+        message(FATAL_ERROR "Unable to find required Monero library ${LIB}")
+      endif()
+    else ()
+      set(LIB_NAME "monero::${LIB}")
+      add_library(${LIB_NAME} STATIC IMPORTED)
+      set_target_properties(${LIB_NAME} PROPERTIES IMPORTED_LOCATION ${LIB_PATH})
+      list(APPEND IMPORTED_MONERO_LIBRARIES "${LIB_NAME}")
+    endif()
+    unset(LIB_PATH CACHE)
+  endforeach()
+
+  set(LMDB_INCLUDE "${monero_LMDB_INCLUDE}")
+  set(LMDB_LIB_PATH "monero::lmdb")
+else () # NOT MONERO_BUILD_DIR
+  if (NOT MONERO_SOURCE_DIR)
+    set (MONERO_SOURCE_DIR "${CMAKE_SOURCE_DIR}/../monero")
+  endif ()
+
+  include(FetchContent)
+  FetchContent_Declare(monero SOURCE_DIR "${MONERO_SOURCE_DIR}" EXCLUDE_FROM_ALL)
+
+  if (NOT monero_POPULATED)
+    FetchContent_MakeAvailable(monero)
+  endif ()
+
+  set(MONERO_BUILD_DIR "${monero_BINARY_DIR}")
+  set(IMPORTED_MONERO_LIBRARIES "${MONERO_LIBRARIES}")
+  set(monero_Boost_THREAD_LIBRARY_RELEASE "${Boost_THREAD_LIBRARY_RELEASE}")
+  set(monero_pkgcfg_lib_libzmq_zmq "${pkgcfg_lib_libzmq_zmq}")
+  if (SODIUM_LIBRARY)
+    set(monero_SODIUM_LIBRARY "${SODIUM_LIBRARY}")
+  else()
+    set(monero_SODIUM_LIBRARY "${monero_sodium_LIBRARY_RELEASE}")
+  endif()
+endif()
 
 #
-# Pull some information from monero build
-#
-
-# Needed due to "bug" in monero CMake - the `project` function is used twice!
-if (NOT MONERO_SOURCE_DIR)
-  message(FATAL_ERROR "The argument -DMONERO_SOURCE_DIR must specify a location of a monero source tree")
-endif()
-
-if (NOT MONERO_BUILD_DIR)
-  message(FATAL_ERROR "The argument -DMONERO_BUILD_DIR must specify a location of an existing monero build")
-endif()
-
-load_cache(${MONERO_BUILD_DIR} READ_WITH_PREFIX monero_
-  Boost_THREAD_LIBRARY_RELEASE
-  CMAKE_CXX_COMPILER
-  EXTRA_LIBRARIES
-  HIDAPI_INCLUDE_DIR
-  LMDB_INCLUDE
-  monero_SOURCE_DIR
-  OPENSSL_CRYPTO_LIBRARY
-  OPENSSL_SSL_LIBRARY
-  SODIUM_LIBRARY
-  UNBOUND_LIBRARIES
-  ZMQ_INCLUDE_PATH
-  ZMQ_LIB
-)
-
-if (NOT (monero_monero_SOURCE_DIR MATCHES "${MONERO_SOURCE_DIR}(/src/cryptonote_protocol)"))
-  message(FATAL_ERROR "Invalid Monero source dir - does not appear to match source used for build directory")
-endif()
-
-if (NOT (CMAKE_CXX_COMPILER STREQUAL monero_CMAKE_CXX_COMPILER))
-  message(FATAL_ERROR "Compiler for monero build differs from this project")
-endif()
-
-if ("${monero_UNBOUND_LIBRARIES}" STREQUAL "UNBOUND_LIBRARIES-NOTFOUND")
-  unset(monero_UNBOUND_LIBRARIES)
-endif()
-
-#
-# Dependencies specific to monero-lws
+# Dependencies specific to xfo-lws
 #
 
 set(THREADS_PREFER_PTHREAD_FLAG ON)
@@ -128,7 +221,7 @@ if(STATIC)
   set(Boost_USE_STATIC_LIBS ON)
   set(Boost_USE_STATIC_RUNTIME ON)
 endif()
-find_package(Boost 1.58 QUIET REQUIRED COMPONENTS chrono filesystem program_options regex serialization system thread)
+find_package(Boost 1.70 QUIET REQUIRED COMPONENTS chrono context coroutine filesystem program_options regex serialization thread)
 
 if (NOT (Boost_THREAD_LIBRARY STREQUAL monero_Boost_THREAD_LIBRARY_RELEASE))
   message(STATUS "Found Boost_THREAD_LIBRARY: ${Boost_THREAD_LIBRARY}")
@@ -136,120 +229,59 @@ if (NOT (Boost_THREAD_LIBRARY STREQUAL monero_Boost_THREAD_LIBRARY_RELEASE))
   message(FATAL_ERROR "Boost libraries for monero build differs from this project")
 endif()
 
-# hidapi
-# https://github.com/moneroexamples/openmonero/blob/18370af8fa51a0e9d05dfe678dcd5bcb7fad30f7/cmake/FindHIDAPI.cmake#L26-L60
-find_library(HIDAPI_LIBRARY
-  NAMES hidapi hidapi-libusb)
-
-find_path(HIDAPI_INCLUDE_DIR
-  NAMES hidapi.h
-  PATH_SUFFIXES
-  hidapi)
-
-include(FindPackageHandleStandardArgs)
-find_package_handle_standard_args(HIDAPI
-  DEFAULT_MSG
-  HIDAPI_LIBRARY
-  HIDAPI_INCLUDE_DIR)
-
-if(HIDAPI_FOUND)
-  set(HIDAPI_LIBRARIES "${HIDAPI_LIBRARY}")
-  if((STATIC AND UNIX AND NOT APPLE) OR (DEPENDS AND CMAKE_SYSTEM_NAME STREQUAL "Linux"))
-    find_library(LIBUSB-1.0_LIBRARY usb-1.0)
-    find_library(LIBUDEV_LIBRARY udev)
-    if(LIBUSB-1.0_LIBRARY)
-      set(HIDAPI_LIBRARIES "${HIDAPI_LIBRARIES};${LIBUSB-1.0_LIBRARY}")
-      if(LIBUDEV_LIBRARY)
-        set(HIDAPI_LIBRARIES "${HIDAPI_LIBRARIES};${LIBUDEV_LIBRARY}")
-      else()
-        message(WARNING "libudev library not found, binaries may fail to link.")
-      endif()
-    else()
-      message(WARNING "libusb-1.0 library not found, binaries may fail to link.")
-    endif()
-  endif()
-
-  set(HIDAPI_INCLUDE_DIRS "${HIDAPI_INCLUDE_DIR}")
+if (WITH_RMQ)
+  find_path(RMQ_INCLUDE_DIR "amqp.h")
+  find_library(RMQ_LIBRARY rabbitmq REQUIRED)
+else()
+  set(RMQ_INCLUDE_DIR "")
+  set(RMQ_LIBRARY "")
 endif()
 
-mark_as_advanced(HIDAPI_INCLUDE_DIR HIDAPI_LIBRARY)
-
-if (NOT (HIDAPI_INCLUDE_DIR STREQUAL monero_HIDAPI_INCLUDE_DIR))
-  message(STATUS "Found HIDAPI_INCLUDE_DIR: ${HIDAPI_INCLUDE_DIR}")
-  message(STATUS "Found monero_HIDAPI_INCLUDE_DIR: ${monero_HIDAPI_INCLUDE_DIR}")
-  message(FATAL_ERROR "hidapi libraries for monero build differs from this project")
+if (libzmq_INCLUDE_DIRS)
+  set(ZMQ_INCLUDE_PATH "${libzmq_INCLUDE_DIRS}")
+elseif(monero_ZMQ_INCLUDE_PATH)
+  set(ZMQ_INCLUDE_PATH "${monero_ZMQ_INCLUDE_PATH}")
+else()
+  set(ZMQ_INCLUDE_PATH "")
 endif()
 
-# openssl
-if (STATIC)
-  set(OPENSSL_USE_STATIC_LIBS TRUE)
+if (monero_pkgcfg_lib_libzmq_zmq)
+  set(ZMQ_LIB "${monero_pkgcfg_lib_libzmq_zmq}")
+elseif(monero_ZMQ_LIB)
+  set(ZMQ_LIB "${monero_ZMQ_LIB}")
+else()
+  set(ZMQ_LIB "")
 endif()
-find_package(OpenSSL REQUIRED)
+if (monero_SODIUM_LIBRARY)
+  set(SODIUM_LIBRARY "${monero_SODIUM_LIBRARY}")
+else ()
+  set(SODIUM_LIBRARY "${monero_sodium_LIBRARY_RELEASE}")
+endif ()
 
-if (NOT (OPENSSL_CRYPTO_LIBRARY STREQUAL monero_OPENSSL_CRYPTO_LIBRARY))
-  message(STATUS "Found OPENSSL_CRYPTO_LIBRARY: ${OPENSSL_CRYPTO_LIBRARY}")
-  message(STATUS "Found monero_OPENSSL_CRYPTO_LIBRARY: ${monero_OPENSSL_CRYPTO_LIBRARY}")
-  message(FATAL_ERROR "openssl libraries for monero build differs from this project")
-endif()
-
-# zmq
-# https://github.com/monero-project/monero/blob/9aab19f349433687c7aaf2c1cbc5751e5912c0aa/CMakeLists.txt#L1171-L1199
-if(STATIC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DZMQ_STATIC")
-endif()
-find_path(ZMQ_INCLUDE_PATH zmq.h)
-find_library(ZMQ_LIB zmq)
-find_library(PGM_LIBRARY pgm)
-find_library(NORM_LIBRARY norm)
-find_library(GSSAPI_LIBRARY gssapi_krb5)
-find_library(PROTOLIB_LIBRARY protolib)
-find_library(SODIUM_LIBRARY sodium)
-
-if(NOT ZMQ_INCLUDE_PATH)
-  message(FATAL_ERROR "Could not find required header zmq.h")
-endif()
 if(NOT ZMQ_LIB)
   message(FATAL_ERROR "Could not find required libzmq")
 endif()
-if(PGM_LIBRARY)
-  set(ZMQ_LIB "${ZMQ_LIB};${PGM_LIBRARY}")
+if(monero_PGM_LIBRARY)
+  set(ZMQ_LIB "${ZMQ_LIB};${monero_PGM_LIBRARY}")
 endif()
-if(NORM_LIBRARY)
-  set(ZMQ_LIB "${ZMQ_LIB};${NORM_LIBRARY}")
+if(monero_NORM_LIBRARY)
+  set(ZMQ_LIB "${ZMQ_LIB};${monero_NORM_LIBRARY}")
 endif()
-if(GSSAPI_LIBRARY)
-  set(ZMQ_LIB "${ZMQ_LIB};${GSSAPI_LIBRARY}")
+if(monero_GSSAPI_LIBRARY)
+  set(ZMQ_LIB "${ZMQ_LIB};${monero_GSSAPI_LIBRARY}")
 endif()
-if(PROTOLIB_LIBRARY)
-  set(ZMQ_LIB "${ZMQ_LIB};${PROTOLIB_LIBRARY}")
+if(monero_PROTOLIB_LIBRARY)
+  set(ZMQ_LIB "${ZMQ_LIB};${monero_PROTOLIB_LIBRARY}")
 endif()
-if(SODIUM_LIBRARY)
-  set(ZMQ_LIB "${ZMQ_LIB};${SODIUM_LIBRARY}")
-endif()
-
-if (NOT (ZMQ_INCLUDE_PATH STREQUAL monero_ZMQ_INCLUDE_PATH))
-  message(STATUS "Found ZMQ_INCLUDE_PATH: ${ZMQ_INCLUDE_PATH}")
-  message(STATUS "Found monero_ZMQ_INCLUDE_PATH: ${monero_ZMQ_INCLUDE_PATH}")
-  message(FATAL_ERROR "zmq libraries for monero build differs from this project")
+if(monero_sodium_LIBRARY_RELEASE)
+  set(ZMQ_LIB "${ZMQ_LIB};${monero_sodium_LIBRARY_RELEASE}")
 endif()
 
-foreach (LIB ${MONERO_LIBRARIES})
-  find_library(LIB_PATH NAMES "${LIB}" PATHS ${MONERO_BUILD_DIR} PATH_SUFFIXES "/src/${LIB}" "external/${LIB}" ${MONERO_SEARCH_PATHS} NO_DEFAULT_PATH)
-
-  list(FIND MONERO_OPTIONAL "${LIB}" LIB_OPTIONAL)
-  if (NOT LIB_PATH)
-    if (LIB_OPTIONAL EQUAL -1)
-      message(FATAL_ERROR "Unable to find required Monero library ${LIB}")
-    endif()
-  else ()
-    set(LIB_NAME "monero::${LIB}")
-    add_library(${LIB_NAME} STATIC IMPORTED)
-    set_target_properties(${LIB_NAME} PROPERTIES IMPORTED_LOCATION ${LIB_PATH})
-    list(APPEND IMPORTED_MONERO_LIBRARIES "${LIB_NAME}")
+if(STATIC AND NOT IOS)
+  if(UNIX)
+    set(monero_OPENSSL_LIBRARIES "${monero_OPENSSL_LIBRARIES};${CMAKE_DL_LIBS};${CMAKE_THREAD_LIBS_INIT}")
   endif()
-  
-  unset(LIB_PATH CACHE)
-endforeach()
+endif()
 
 if(APPLE)
   find_library(IOKIT_LIBRARY IOKit)
@@ -260,9 +292,8 @@ add_library(monero::libraries INTERFACE IMPORTED)
 set_property(TARGET monero::libraries PROPERTY
   INTERFACE_INCLUDE_DIRECTORIES
     ${Boost_INCLUDE_DIR}
-    ${HIDAPI_INCLUDE_DIRS}
-    ${OPENSSL_INCLUDE_DIR}
-    ${ZMQ_INCLUDE_PATH}
+    ${monero_HIDAPI_INCLUDE_DIRS}
+    ${monero_OPENSSL_INCLUDE_DIR}
     "${MONERO_BUILD_DIR}/generated_include"
     "${MONERO_SOURCE_DIR}/contrib/epee/include"
     "${MONERO_SOURCE_DIR}/external/easylogging++"
@@ -270,28 +301,34 @@ set_property(TARGET monero::libraries PROPERTY
     "${MONERO_SOURCE_DIR}/external/supercop/include"
     "${MONERO_SOURCE_DIR}/src"
 )
+
 set_property(TARGET monero::libraries PROPERTY
   INTERFACE_LINK_LIBRARIES
     ${IMPORTED_MONERO_LIBRARIES}
     ${Boost_CHRONO_LIBRARY}
     ${Boost_FILESYSTEM_LIBRARY}
+    ${Boost_PROGRAM_OPTIONS_LIBRARY}
     ${Boost_REGEX_LIBRARY}
     ${Boost_SERIALIZATION_LIBRARY}
     ${Boost_SYSTEM_LIBRARY}
     ${Boost_THREAD_LIBRARY}
-    ${HIDAPI_LIBRARIES}
-    ${OPENSSL_LIBRARIES}
-    ${monero_SODIUM_LIBRARY}
+    ${monero_HIDAPI_LIBRARY}
+    ${monero_usb_LIBRARY}
+    ${monero_LIBUDEV_LIBRARY}
+    ${monero_OPENSSL_SSL_LIBRARY}
+    ${monero_OPENSSL_CRYPTO_LIBRARY}
+    ${SODIUM_LIBRARY}
     ${monero_UNBOUND_LIBRARIES}
     ${CMAKE_DL_LIBS}
 )
 
-set(LMDB_INCLUDE "${monero_LMDB_INCLUDE}")
-set(LMDB_LIB_PATH "monero::lmdb")
-
-
 #
-# Build monero-lws code
+# Build xfo-lws code
 #
 
 add_subdirectory(src)
+
+if (LWS_BUILD_TESTS)
+  enable_testing()
+  add_subdirectory(tests)
+endif()

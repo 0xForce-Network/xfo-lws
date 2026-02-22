@@ -1,4 +1,4 @@
-# Copyright (c) 2020, The Monero Project
+# Copyright (c) 2020-2024, The Monero Project
 #
 # All rights reserved.
 #
@@ -26,8 +26,11 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-set(monero-lws-rpc_sources client.cpp daemon_pub.cpp daemon_zmq.cpp light_wallet.cpp rates.cpp)
-set(monero-lws-rpc_headers client.h daemon_pub.h daemon_zmq.h fwd.h json.h light_wallet.h rates.h)
+add_subdirectory(scanner)
 
-add_library(monero-lws-rpc ${monero-lws-rpc_sources} ${monero-lws-rpc_headers})
-target_link_libraries(monero-lws-rpc monero::libraries monero-lws-wire-json)
+set(xfo-lws-rpc_sources admin.cpp client.cpp daemon_pub.cpp daemon_zmq.cpp light_wallet.cpp lws_pub.cpp rates.cpp)
+set(xfo-lws-rpc_headers admin.h client.h daemon_pub.h daemon_zmq.h fwd.h json.h light_wallet.h lws_pub.h rates.h)
+
+add_library(xfo-lws-rpc ${xfo-lws-rpc_sources} ${xfo-lws-rpc_headers})
+target_include_directories(xfo-lws-rpc PRIVATE ${RMQ_INCLUDE_DIR})
+target_link_libraries(xfo-lws-rpc monero::libraries xfo-lws-util xfo-lws-wire-json xfo-lws-wire-wrapper ${RMQ_LIBRARY})

@@ -65,14 +65,18 @@ namespace lws
 
   namespace rpc
   {
-    const char crypto_compare_::host[] = "https://min-api.cryptocompare.com:443";
-    const char crypto_compare_::path[] =
-      "/data/price?fsym=XMR&tsyms=AUD,BRL,BTC,CAD,CHF,CNY,EUR,GBP,"
-      "HKD,INR,JPY,KRW,MXN,NOK,NZD,SEK,SGD,TRY,USD,RUB,ZAR";
+    const char crypto_compare_::url[] =
+      "https://min-api.cryptocompare.com"
+        "/data/price?fsym=XMR&tsyms=AUD,BRL,BTC,CAD,CHF,CNY,EUR,GBP,"
+        "HKD,INR,JPY,KRW,MXN,NOK,NZD,SEK,SGD,TRY,USD,RUB,ZAR";
 
     expect<lws::rates> crypto_compare_::operator()(std::string&& body) const
     {
-      return wire::json::from_bytes<lws::rates>(std::move(body));
+      lws::rates out{};
+      const std::error_code error = wire::json::from_bytes(std::move(body), out);
+      if (error)
+        return error;
+      return {std::move(out)};
     }
   } // rpc
 } // lws

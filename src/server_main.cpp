@@ -43,6 +43,8 @@
 #include "config.h"
 #include "cryptonote_config.h"   // monero/src/
 #include "db/storage.h"
+#include "error.h"
+#include "lws_version.h"
 #include "options.h"
 #include "rest_server.h"
 #include "scanner.h"
@@ -56,7 +58,17 @@ namespace
   {
     const command_line::arg_descriptor<std::string> daemon_rpc;
     const command_line::arg_descriptor<std::string> daemon_sub;
+    const command_line::arg_descriptor<std::string> zmq_pub;
+#ifdef MLWS_RMQ_ENABLED
+    const command_line::arg_descriptor<std::string> rmq_address;
+    const command_line::arg_descriptor<std::string> rmq_credentials;
+    const command_line::arg_descriptor<std::string> rmq_exchange;
+    const command_line::arg_descriptor<std::string> rmq_routing;
+#endif
     const command_line::arg_descriptor<std::vector<std::string>> rest_servers;
+    const command_line::arg_descriptor<std::vector<std::string>> admin_rest_servers;
+    const command_line::arg_descriptor<std::string> lws_server_addr;
+    const command_line::arg_descriptor<std::string> lws_server_pass;
     const command_line::arg_descriptor<std::string> rest_ssl_key;
     const command_line::arg_descriptor<std::string> rest_ssl_cert;
     const command_line::arg_descriptor<std::size_t> rest_threads;
@@ -66,6 +78,20 @@ namespace
     const command_line::arg_descriptor<unsigned> create_queue_max;
     const command_line::arg_descriptor<std::chrono::minutes::rep> rates_interval;
     const command_line::arg_descriptor<unsigned short> log_level;
+    const command_line::arg_descriptor<bool> disable_admin_auth;
+    const command_line::arg_descriptor<std::string> webhook_ssl_verification;
+    const command_line::arg_descriptor<std::string> config_file;
+    const command_line::arg_descriptor<std::uint32_t> max_subaddresses;
+    const command_line::arg_descriptor<bool> auto_accept_creation;
+    const command_line::arg_descriptor<bool> untrusted_daemon;
+    const command_line::arg_descriptor<bool> regtest;
+    const command_line::arg_descriptor<bool> version;
+    const command_line::arg_descriptor<bool> auto_accept_import;
+    const command_line::arg_descriptor<bool> block_depth_threading;
+    const command_line::arg_descriptor<std::uint64_t> min_block_depth;
+    const command_line::arg_descriptor<double> split_sync_threads;
+    const command_line::arg_descriptor<std::uint64_t> split_sync_depth;
+    const command_line::arg_descriptor<bool> balance_new_addresses;
 
     static std::string get_default_zmq()
     {
@@ -87,7 +113,17 @@ namespace
       : lws::options()
       , daemon_rpc{"daemon", "<protocol>://<address>:<port> of a monerod ZMQ RPC", get_default_zmq()}
       , daemon_sub{"sub", "tcp://address:port or ipc://path of a monerod ZMQ Pub", ""}
-      , rest_servers{"rest-server", "[(https|http)://<address>:]<port> for incoming connections, multiple declarations allowed"}
+      , zmq_pub{"zmq-pub", "tcp://address:port or ipc://path of a bind location for ZMQ pub events", ""}
+#ifdef MLWS_RMQ_ENABLED
+      , rmq_address{"rmq-address", "tcp://<host>/[vhost]"}
+      , rmq_credentials{"rmq-credentials", "<user>:<pass>"}
+      , rmq_exchange{"rmq-exchange", "Name of the RMQ exchange"}
+      , rmq_routing{"rmq-routing", "Routing for the specified exchange"}
+#endif
+      , rest_servers{"rest-server", "[(https|http)://<address>:]<port>[/<prefix>] for incoming connections, multiple declarations allowed"}
+      , admin_rest_servers{"admin-rest-server", "[(https|http])://<address>:]<port>[/<prefix>] for incoming admin connections, multiple declarations allowed"}
+      , lws_server_addr{"lws-server-addr", "[<ip>:]<port> to listen for lws-clients", ""}
+      , lws_server_pass{"lws-server-pass", "Password for lws-clients connecting to server", ""}
       , rest_ssl_key{"rest-ssl-key", "<path> to PEM formatted SSL key for https REST server", ""}
       , rest_ssl_cert{"rest-ssl-certificate", "<path> to PEM formatted SSL certificate (chains supported) for https REST server", ""}
       , rest_threads{"rest-threads", "Number of threads to process REST connections", 1}
@@ -97,6 +133,20 @@ namespace
       , create_queue_max{"create-queue-max", "Set pending create account requests maximum", 10000}
       , rates_interval{"exchange-rate-interval", "Retrieve exchange rates in minute intervals from cryptocompare.com if greater than 0", 0}
       , log_level{"log-level", "Log level [0-4]", 1}
+      , disable_admin_auth{"disable-admin-auth", "Make auth field optional in HTTP-REST requests", false}
+      , webhook_ssl_verification{"webhook-ssl-verification", "[<none|system_ca>] specify SSL verification mode for webhooks", "system_ca"}
+      , config_file{"config-file", "Specify any option in a config file; <name>=<value> on separate lines"}
+      , max_subaddresses{"max-subaddresses", "Maximum number of subaddresses per primary account (defaults to 0)", 0}
+      , auto_accept_creation{"auto-accept-creation", "New account creation requests are automatically accepted", false}
+      , untrusted_daemon{"untrusted-daemon", "Perform (expensive) chain-verification and PoW checks", false}
+      , regtest{"regtest", "Run in a regression testing mode", false}
+      , version{"version", "Display version and quit", false}
+      , auto_accept_import{"auto-accept-import", "Account import requests are automatically accepted", false}
+      , block_depth_threading{"block-depth-threading", "Balance thread workload by block depth instead of account count", false}
+      , min_block_depth{"min-block-depth", "Minimum block depth for block depth threading (defaults to 16)", lws::MINIMUM_BLOCK_DEPTH}
+      , split_sync_threads{"split-sync-threads", "Percentage of threads to use for fully synced accounts (0-1, requires --block-depth-threading, 0 to disable)", 0.0}
+      , split_sync_depth{"split-sync-depth", "Maximum block depth for an address to be considered synced (defaults to 10)", 10}
+      , balance_new_addresses{"balance-new-addresses", "Assign new addresses to thread with highest blockheight (or fewest addresses if tied)", false}
     {}
 
     void prepare(boost::program_options::options_description& description) const
@@ -106,7 +156,17 @@ namespace
       lws::options::prepare(description);
       command_line::add_arg(description, daemon_rpc);
       command_line::add_arg(description, daemon_sub);
+      command_line::add_arg(description, lws_server_addr);
+      command_line::add_arg(description, lws_server_pass);
+      command_line::add_arg(description, zmq_pub);
+#ifdef MLWS_RMQ_ENABLED
+      command_line::add_arg(description, rmq_address);
+      command_line::add_arg(description, rmq_credentials);
+      command_line::add_arg(description, rmq_exchange);
+      command_line::add_arg(description, rmq_routing);
+#endif
       description.add_options()(rest_servers.name, boost::program_options::value<std::vector<std::string>>()->default_value({rest_default}, rest_default), rest_servers.description);
+      command_line::add_arg(description, admin_rest_servers);
       command_line::add_arg(description, rest_ssl_key);
       command_line::add_arg(description, rest_ssl_cert);
       command_line::add_arg(description, rest_threads);
@@ -116,6 +176,20 @@ namespace
       command_line::add_arg(description, create_queue_max);
       command_line::add_arg(description, rates_interval);
       command_line::add_arg(description, log_level);
+      command_line::add_arg(description, disable_admin_auth);
+      command_line::add_arg(description, webhook_ssl_verification);
+      command_line::add_arg(description, config_file);
+      command_line::add_arg(description, max_subaddresses);
+      command_line::add_arg(description, auto_accept_creation);
+      command_line::add_arg(description, untrusted_daemon);
+      command_line::add_arg(description, regtest);
+      command_line::add_arg(description, version);
+      command_line::add_arg(description, auto_accept_import);
+      command_line::add_arg(description, block_depth_threading);
+      command_line::add_arg(description, min_block_depth);
+      command_line::add_arg(description, split_sync_threads);
+      command_line::add_arg(description, split_sync_depth);
+      command_line::add_arg(description, balance_new_addresses);
     }
   };
 
@@ -123,19 +197,38 @@ namespace
   {
     std::string db_path;
     std::vector<std::string> rest_servers;
+    std::vector<std::string> admin_rest_servers;
+    std::string lws_server_addr;
+    std::string lws_server_pass;
     lws::rest_server::configuration rest_config;
     std::string daemon_rpc;
     std::string daemon_sub;
+    std::string zmq_pub;
+    lws::rpc::rmq_details rmq;
+    std::string webhook_ssl_verification;
     std::chrono::minutes rates_interval;
     std::size_t scan_threads;
+    std::uint64_t split_sync_depth;
+    std::uint64_t min_block_depth;
     unsigned create_queue_max;
+    double split_sync_threads;
+    bool untrusted_daemon;
+    bool regtest;
+    bool block_depth_threading;
+    bool balance_new_addresses;
   };
+
+  void print_version(std::ostream& out)
+  {
+    std::cout << lws::version::name << " version " << lws::version::id << " commit " << lws::version::commit << std::endl;;
+  }
 
   void print_help(std::ostream& out)
   {
     boost::program_options::options_description description{"Options"};
     options{}.prepare(description);
 
+    print_version(out);
     out << "Usage: [options]" << std::endl;
     out << description;
   }
@@ -154,6 +247,18 @@ namespace
         po::command_line_parser(argc, argv).options(description).run(), args
       );
       po::notify(args);
+
+      if (!command_line::is_arg_defaulted(args, opts.config_file))
+      {
+        boost::filesystem::path config_path{command_line::get_arg(args, opts.config_file)};
+        if (!boost::filesystem::exists(config_path))
+          MONERO_THROW(lws::error::configuration, "Config file does not exist");
+
+        po::store(
+          po::parse_config_file<char>(config_path.string<std::string>().c_str(), description), args
+        );
+        po::notify(args);
+      }
     }
 
     if (command_line::get_arg(args, command_line::arg_help))
@@ -162,27 +267,80 @@ namespace
       return boost::none;
     }
 
+    if (command_line::get_arg(args, opts.version))
+    {
+      print_version(std::cout);
+      return boost::none;
+    }
+
     opts.set_network(args); // do this first, sets global variable :/
     mlog_set_log_level(command_line::get_arg(args, opts.log_level));
+
+    const auto webhook_verify_raw = command_line::get_arg(args, opts.webhook_ssl_verification);
+    epee::net_utils::ssl_verification_t webhook_verify = epee::net_utils::ssl_verification_t::none;
+    if (webhook_verify_raw == "system_ca")
+      webhook_verify = epee::net_utils::ssl_verification_t::system_ca;
+    else if (webhook_verify_raw != "none")
+      MONERO_THROW(lws::error::configuration, "Invalid webhook ssl verification mode");
 
     program prog{
       command_line::get_arg(args, opts.db_path),
       command_line::get_arg(args, opts.rest_servers),
+      command_line::get_arg(args, opts.admin_rest_servers),
+      command_line::get_arg(args, opts.lws_server_addr),
+      command_line::get_arg(args, opts.lws_server_pass),
       lws::rest_server::configuration{
         {command_line::get_arg(args, opts.rest_ssl_key), command_line::get_arg(args, opts.rest_ssl_cert)},
         command_line::get_arg(args, opts.access_controls),
         command_line::get_arg(args, opts.rest_threads),
-        command_line::get_arg(args, opts.external_bind)
+	      command_line::get_arg(args, opts.max_subaddresses),
+        webhook_verify,
+        command_line::get_arg(args, opts.external_bind),
+        command_line::get_arg(args, opts.disable_admin_auth),
+        command_line::get_arg(args, opts.auto_accept_creation),
+        command_line::get_arg(args, opts.auto_accept_import)
       },
       command_line::get_arg(args, opts.daemon_rpc),
       command_line::get_arg(args, opts.daemon_sub),
+      command_line::get_arg(args, opts.zmq_pub),
+#ifdef MLWS_RMQ_ENABLED
+      lws::rpc::rmq_details{
+        command_line::get_arg(args, opts.rmq_address),
+        command_line::get_arg(args, opts.rmq_credentials),
+        command_line::get_arg(args, opts.rmq_exchange),
+        command_line::get_arg(args, opts.rmq_routing)
+      },
+#else
+      lws::rpc::rmq_details{},
+#endif
+      command_line::get_arg(args, opts.webhook_ssl_verification),
       std::chrono::minutes{command_line::get_arg(args, opts.rates_interval)},
       command_line::get_arg(args, opts.scan_threads),
+      command_line::get_arg(args, opts.split_sync_depth),
+      command_line::get_arg(args, opts.min_block_depth),
       command_line::get_arg(args, opts.create_queue_max),
+      command_line::get_arg(args, opts.split_sync_threads),
+      command_line::get_arg(args, opts.untrusted_daemon),
+      command_line::get_arg(args, opts.regtest),
+      command_line::get_arg(args, opts.block_depth_threading),
+      command_line::get_arg(args, opts.balance_new_addresses)
     };
 
+    if (prog.regtest && lws::config::network != cryptonote::MAINNET)
+      MONERO_THROW(lws::error::configuration, "Regtest cannot be used with testnet or stagenet");
+
+    if (prog.split_sync_threads < 0.0 || prog.split_sync_threads > 1.0)
+      MONERO_THROW(lws::error::configuration, "--split-sync-threads must be between 0 and 1");
+    
+    if (prog.split_sync_threads > 0.0 && !prog.block_depth_threading)
+      MONERO_THROW(lws::error::configuration, "--split-sync-threads requires --block-depth-threading=true");
+
+    if (!prog.lws_server_addr.empty() && (prog.rest_config.max_subaddresses || prog.untrusted_daemon))
+      MONERO_THROW(lws::error::configuration, "Remote scanning cannot be used with subaddresses or untrusted daemon");
+
     prog.rest_config.threads = std::max(std::size_t(1), prog.rest_config.threads);
-    prog.scan_threads = std::max(std::size_t(1), prog.scan_threads);
+    if (prog.lws_server_addr.empty())
+      prog.scan_threads = std::max(std::size_t(1), prog.scan_threads);
 
     if (command_line::is_arg_defaulted(args, opts.daemon_rpc))
       prog.daemon_rpc = options::get_default_zmq();
@@ -192,21 +350,39 @@ namespace
 
   void run(program prog)
   {
-    std::signal(SIGINT, [] (int) { lws::scanner::stop(); });
+    MINFO(lws::version::name << " version " << lws::version::id << " commit " << lws::version::commit);
+
+    auto sub_address = prog.daemon_sub;
 
     boost::filesystem::create_directories(prog.db_path);
     auto disk = lws::db::storage::open(prog.db_path.c_str(), prog.create_queue_max);
-    auto ctx = lws::rpc::context::make(std::move(prog.daemon_rpc), std::move(prog.daemon_sub), prog.rates_interval);
+    auto ctx = lws::rpc::context::make(std::move(prog.daemon_rpc), std::move(prog.daemon_sub), std::move(prog.zmq_pub), std::move(prog.rmq), prog.rates_interval, prog.untrusted_daemon);
+
+    //! SIGINT handle registered by `scanner` constructor
+    lws::scanner scanner{disk.clone(), prog.rest_config.webhook_verify};
 
     MINFO("Using monerod ZMQ RPC at " << ctx.daemon_address());
-    auto client = lws::scanner::sync(disk.clone(), ctx.connect().value()).value();
+    if (!sub_address.empty())
+      MINFO("Using monerod ZMQ sub at " << sub_address);
 
-    lws::rest_server server{epee::to_span(prog.rest_servers), disk.clone(), std::move(client), std::move(prog.rest_config)};
+    auto client = scanner.sync(ctx.connect().value(), prog.untrusted_daemon).value();
+
+    lws::rest_server server{
+      epee::to_span(prog.rest_servers), prog.admin_rest_servers, std::move(disk), std::move(client), std::move(prog.rest_config)
+    };
     for (const std::string& address : prog.rest_servers)
       MINFO("Listening for REST clients at " << address);
+    for (const std::string& address : prog.admin_rest_servers)
+      MINFO("Listening for REST admin clients at " << address);
 
     // blocks until SIGINT
-    lws::scanner::run(std::move(disk), std::move(ctx), prog.scan_threads);
+    scanner.run(
+      std::move(ctx),
+      prog.scan_threads,
+      std::move(prog.lws_server_addr),
+      std::move(prog.lws_server_pass),
+      lws::scanner_options{prog.split_sync_threads, prog.split_sync_depth, prog.min_block_depth, prog.rest_config.max_subaddresses, prog.untrusted_daemon, prog.regtest, prog.block_depth_threading, prog.balance_new_addresses}
+    );
   }
 } // anonymous
 

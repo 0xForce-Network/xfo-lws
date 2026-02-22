@@ -1,4 +1,4 @@
-// Copyright (c) 2020, The Monero Project
+// Copyright (c) 2024, The Monero Project
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without modification, are
@@ -25,53 +25,12 @@
 // STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 // THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-#pragma once
+#include <vector>
+#include "byte_slice.h" // monero/contrib/epee/include
+#include "fwd.h"
 
-#include <type_traits>
-
-#include "crypto/crypto.h"   // monero/src
-#include "ringct/rctTypes.h" // monero/src
-#include "wire/traits.h"
-
-namespace wire
+namespace lws_test
 {
-  template<>
-  struct is_blob<crypto::ec_scalar>
-    : std::true_type
-  {};
-
-  template<>
-  struct is_blob<crypto::hash>
-    : std::true_type
-  {};
-
-  template<>
-  struct is_blob<crypto::key_derivation>
-    : std::true_type
-  {};
-
-  template<>
-  struct is_blob<crypto::key_image>
-    : std::true_type
-  {};
-
-  template<>
-  struct is_blob<crypto::public_key>
-    : std::true_type
-  {};
-
-  template<>
-  struct is_blob<crypto::signature>
-    : std::true_type
-  {};
-
-  template<>
-  struct is_blob<rct::key>
-    : std::true_type
-  {};
-
-  template<>
-  struct is_blob<crypto::view_tag>
-    : std::true_type
-  {};
+  constexpr const char rpc_rendevous[] = "inproc://fake_daemon";
+  void rpc_thread(void* ctx, const std::vector<epee::byte_slice>& reply);
 }

@@ -1,4 +1,4 @@
-# Copyright (c) 2020, The Monero Project
+# Copyright (c) 2020-2023, The Monero Project
 #
 # All rights reserved.
 #
@@ -26,11 +26,13 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-set(monero-lws-wire_sources error.cpp read.cpp write.cpp)
-set(monero-lws-wire_headers crypto.h error.h field.h filters.h fwd.h json.h read.h traits.h vector.h write.h)
+set(xfo-lws-wire_sources error.cpp read.cpp write.cpp)
+set(xfo-lws-wire_headers error.h field.h filters.h fwd.h json.h read.h traits.h vector.h write.h)
 
-add_library(monero-lws-wire ${monero-lws-wire_sources} ${monero-lws-wire_headers})
-target_include_directories(monero-lws-wire PUBLIC "${LMDB_INCLUDE}")
-target_link_libraries(monero-lws-wire PRIVATE monero::libraries)
+add_library(xfo-lws-wire ${xfo-lws-wire_sources} ${xfo-lws-wire_headers})
+target_include_directories(xfo-lws-wire PUBLIC "${LMDB_INCLUDE}")
+target_link_libraries(xfo-lws-wire PRIVATE monero::libraries)
 
 add_subdirectory(json)
+add_subdirectory(msgpack)
+add_subdirectory(wrapper)
