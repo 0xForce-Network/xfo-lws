@@ -218,7 +218,10 @@ namespace db
 
     constexpr const unsigned blocks_version = 0;
     constexpr const unsigned by_address_version = 0;
-    constexpr const unsigned pows_version = 0;
+    // v1: XFO pow_type era. Keep DB key versioned so older pow table entries can
+    // be migrated deterministically instead of being silently ignored.
+    constexpr const unsigned pows_version = 1;
+    constexpr const unsigned pows_previous_version = 0;
 
     template<typename T>
     int less(epee::span<const std::uint8_t> left, epee::span<const std::uint8_t> right) noexcept
@@ -536,7 +539,47 @@ namespace db
         if (err != MDB_NOTFOUND)
           MONERO_THROW(lmdb::error(err), "Unable to retrieve blockchain hashes");
 
-        // new database
+        // Try migration from previous schema key before initializing new DB.
+        MDB_val old_key = lmdb::to_val(pows_previous_version);
+        MDB_val old_value{};
+        int old_err = mdb_cursor_get(cur.get(), &old_key, &old_value, MDB_SET);
+        if (!old_err)
+        {
+          std::vector<block_pow> migrated{};
+          for (;;)
+          {
+            migrated.push_back(MONERO_UNWRAP(pows.get_value<block_pow>(old_value)));
+            old_err = mdb_cursor_get(cur.get(), &old_key, &old_value, MDB_NEXT_DUP);
+            if (old_err)
+            {
+              if (old_err != MDB_NOTFOUND)
+                MONERO_THROW(lmdb::error(old_err), "Unable to read old pow table");
+              break;
+            }
+          }
+
+          old_err = mdb_cursor_get(cur.get(), &old_key, &old_value, MDB_SET);
+          if (old_err)
+            MONERO_THROW(lmdb::error(old_err), "Unable to rewind old pow table");
+          for (;;)
+          {
+            MLWS_LMDB_CHECK(mdb_cursor_del(cur.get(), 0));
+            old_err = mdb_cursor_get(cur.get(), &old_key, &old_value, MDB_NEXT_DUP);
+            if (old_err)
+            {
+              if (old_err != MDB_NOTFOUND)
+                MONERO_THROW(lmdb::error(old_err), "Unable to delete old pow table entries");
+              break;
+            }
+          }
+
+          MONERO_UNWRAP(bulk_insert(*cur, pows_version, epee::to_span(migrated)));
+          return;
+        }
+        if (old_err != MDB_NOTFOUND)
+          MONERO_THROW(lmdb::error(old_err), "Unable to retrieve old pow table");
+
+        // New database.
         block_pow checkpoint{block_id(0), 0u, block_difficulty{0u, 1u}};
         MDB_val value = lmdb::to_val(checkpoint);
         key = lmdb::to_val(pows_version);
