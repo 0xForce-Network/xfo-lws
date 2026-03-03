@@ -18,7 +18,7 @@ env:
 
 jobs:
   build-beginner:
-    runs-on: ${{matrix.os}}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -49,7 +49,7 @@ jobs:
         # Build your program with the given configuration
         run: (cd ${{github.workspace}}/lws/build && make -j$(nproc))
   build-tests:
-    runs-on: ${{matrix.os}}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
@@ -106,7 +106,7 @@ jobs:
     - name: Run Tests
       run: cd ${{github.workspace}}/lws/build && ctest
   build-sanitizer-tests:
-    runs-on: ${{matrix.os}}
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
