@@ -55,7 +55,7 @@ namespace lws { namespace rpc { namespace scanner
     assert(strand_.running_in_this_thread());
     read_buf_.clear();
     read_buf_.put_n(0, size);
-    return boost::asio::mutable_buffer(read_buf_.data(), size);
+    return boost::asio::mutable_buffer(const_cast<void*>(static_cast<const void*>(read_buf_.data())), size);
   }
 
   boost::asio::const_buffer connection::write_buffer() const

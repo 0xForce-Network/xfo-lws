@@ -26,8 +26,8 @@
 # STRICT LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF
 # THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-set(xfo-lws-db_sources account.cpp data.cpp storage.cpp string.cpp)
-set(xfo-lws-db_headers account.h data.h fwd.h storage.h string.h)
+set(xfo-lws-db_sources account.cpp data.cpp multisig_store.cpp storage.cpp string.cpp)
+set(xfo-lws-db_headers account.h data.h fwd.h multisig_store.h storage.h string.h)
 
 add_library(xfo-lws-db ${xfo-lws-db_sources} ${xfo-lws-db_headers})
 target_include_directories(xfo-lws-db PUBLIC "${LMDB_INCLUDE}")

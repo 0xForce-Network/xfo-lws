@@ -66,6 +66,7 @@
 #include "crypto/crypto.h"         // monero/src
 #include "cryptonote_config.h"     // monero/src
 #include "db/data.h"
+#include "db/multisig_store.h"
 #include "db/storage.h"
 #include "db/string.h"
 #include "error.h"
@@ -81,8 +82,10 @@
 #include "rpc/client.h"
 #include "rpc/daemon_messages.h"   // monero/src
 #include "rpc/light_wallet.h"
+#include "rpc/multisig.h"
 #include "rpc/rates.h"
 #include "rpc/webhook.h"
+#include "string_tools.h"          // monero/contrib/epee/include
 #include "util/gamma_picker.h"
 #include "util/random_outputs.h"
 #include "util/source_location.h"
@@ -106,6 +109,7 @@ namespace lws
     const db::storage disk;
     const rpc::client client;
     const runtime_options options;
+    db::multisig_store multisig;
     std::vector<net::zmq::async_client> clients;
     net::http::client webhook_client;
     boost::mutex sync;
@@ -115,6 +119,7 @@ namespace lws
         disk(std::move(disk)),
         client(std::move(client)),
         options(std::move(options)),
+        multisig("/var/data/xfo-lws-db/multisig_store.json"),
         webhook_client(options.webhook_verify),
         clients(),
         sync()
@@ -1135,7 +1140,7 @@ namespace lws
             rpc::safe_uint64(received),
             to_uint(user->first.lookahead_fail),
             std::move(unspent),
-            rpc->fees,
+            std::vector<std::uint64_t>{rpc->estimated_base_fee},
             std::move(req.creds.key)
           }
         );
@@ -1502,6 +1507,82 @@ namespace lws
         }
 
         return response{true, req.generated_locally, req.lookahead};
+      }
+    };
+
+    struct multisig_balance
+    {
+      using request = rpc::multisig_balance_request;
+      using response = rpc::multisig_balance_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        const auto parsed = db::address_string(req.multisig_address);
+        if (!parsed)
+          return {lws::error::bad_address};
+
+        const db::multisig_address_data balance = data.global->multisig.get_balance(req.multisig_address);
+        return response{
+          balance.address,
+          balance.total_locked,
+          static_cast<std::uint32_t>(balance.transactions.size()),
+          balance.primary_context
+        };
+      }
+    };
+
+    struct multisig_register
+    {
+      using request = rpc::multisig_register_tx_request;
+      using response = rpc::multisig_register_tx_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        const auto parsed = db::address_string(req.multisig_address);
+        if (!parsed)
+          return response{false, "Invalid multisig address", 0};
+
+        crypto::secret_key tx_secret_key{};
+        if (!epee::string_tools::hex_to_pod(req.tx_key, tx_secret_key))
+          return response{false, "Invalid tx_key format", 0};
+
+        // TODO(phase6): query chain and decrypt exact output amount with tx_key.
+        constexpr std::uint64_t decoded_amount = 0;
+        if (!data.global->multisig.register_tx(req.multisig_address, req.tx_hash, decoded_amount, req.context))
+          return response{false, "Failed to register transaction", 0};
+
+        return response{true, "Transaction registered successfully", decoded_amount};
+      }
+    };
+
+    struct multisig_txs
+    {
+      using request = rpc::multisig_transactions_request;
+      using response = rpc::multisig_transactions_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        const auto parsed = db::address_string(req.multisig_address);
+        if (!parsed)
+          return {lws::error::bad_address};
+
+        response out{};
+        out.multisig_address = req.multisig_address;
+
+        const auto txs = data.global->multisig.get_transactions(req.multisig_address);
+        out.transactions.reserve(txs.size());
+        for (const auto& tx : txs)
+        {
+          out.transactions.push_back(rpc::multisig_tx_entry{
+            tx.tx_hash,
+            tx.amount,
+            tx.timestamp,
+            tx.context
+          });
+        }
+
+        out.total_locked = data.global->multisig.get_balance(req.multisig_address).total_locked;
+        return out;
       }
     };
 
@@ -1918,6 +1999,9 @@ namespace lws
       {"/get_version",           call<get_version>,            1024, false},
       {"/import_wallet_request", call<import_request>,     2 * 1024, false},
       {"/login",                 call<login>,              2 * 1024, false},
+      {"/multisig/balance",      call<multisig_balance>,   2 * 1024, false},
+      {"/multisig/register_tx",  call<multisig_register>,  4 * 1024, false},
+      {"/multisig/transactions", call<multisig_txs>,       2 * 1024, false},
       {"/provision_subaddrs",    call<provision_subaddrs>, 2 * 1024, false},
       {"/submit_raw_tx",         call<submit_raw_tx>,    512 * 1024,  true},
       {"/upsert_subaddrs",       call<upsert_subaddrs>,   10 * 1024, false}

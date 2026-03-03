@@ -49,7 +49,7 @@ namespace lws { namespace rpc { namespace scanner
     }
 
     const header head{0, id, header::length_type{value_type(sink.size() - sizeof(header))}};
-    std::memcpy(sink.data(), std::addressof(head), sizeof(head));
+    std::memcpy(const_cast<std::uint8_t*>(sink.data()), std::addressof(head), sizeof(head));
     return epee::byte_slice{std::move(sink)};
   }
 }}} // lws // rpc // scanner

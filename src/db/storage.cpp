@@ -563,7 +563,11 @@ namespace db
             MONERO_THROW(lmdb::error(old_err), "Unable to rewind old pow table");
           for (;;)
           {
-            MLWS_LMDB_CHECK(mdb_cursor_del(cur.get(), 0));
+            {
+              const int del_err = mdb_cursor_del(cur.get(), 0);
+              if (del_err)
+                MONERO_THROW(lmdb::error(del_err), "Unable to delete old pow entry");
+            }
             old_err = mdb_cursor_get(cur.get(), &old_key, &old_value, MDB_NEXT_DUP);
             if (old_err)
             {

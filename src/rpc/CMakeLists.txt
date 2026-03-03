@@ -28,8 +28,8 @@
 
 add_subdirectory(scanner)
 
-set(xfo-lws-rpc_sources admin.cpp client.cpp daemon_pub.cpp daemon_zmq.cpp light_wallet.cpp lws_pub.cpp rates.cpp)
-set(xfo-lws-rpc_headers admin.h client.h daemon_pub.h daemon_zmq.h fwd.h json.h light_wallet.h lws_pub.h rates.h)
+set(xfo-lws-rpc_sources admin.cpp client.cpp daemon_pub.cpp daemon_zmq.cpp light_wallet.cpp lws_pub.cpp multisig.cpp rates.cpp)
+set(xfo-lws-rpc_headers admin.h client.h daemon_pub.h daemon_zmq.h fwd.h json.h light_wallet.h lws_pub.h multisig.h rates.h)
 
 add_library(xfo-lws-rpc ${xfo-lws-rpc_sources} ${xfo-lws-rpc_headers})
 target_include_directories(xfo-lws-rpc PRIVATE ${RMQ_INCLUDE_DIR})
