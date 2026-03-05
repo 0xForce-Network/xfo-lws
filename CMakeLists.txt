@@ -34,6 +34,12 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 add_definitions(-DBOOST_UUID_DISABLE_ALIGNMENT) # This restores UUID's std::has_unique_object_representations property
 
+# --- Semi-static linking defaults (Linux) ---
+# NOTE: -static-libgcc -static-libstdc++ was REMOVED because shared deps
+# (libzmq, libunbound, etc.) transitively load the dynamic copies anyway,
+# creating a dual-runtime conflict that causes SIGABRT on shutdown.
+# Boost is still linked statically via Boost_USE_STATIC_LIBS ON.
+
 option(BUILD_TESTS "Build Tests" OFF)
 option(WITH_RMQ "Build with RMQ publish support" OFF)
 if (WITH_RMQ)
@@ -217,16 +223,32 @@ find_package(Threads REQUIRED)
 
 # boost
 set(Boost_NO_BOOST_CMAKE ON)
+# Always prefer static Boost libraries (semi-static default).
+# Note: Boost_USE_STATIC_RUNTIME is intentionally NOT set — system Boost
+# packages on Ubuntu/Debian are not built against a static C runtime.
+set(Boost_USE_STATIC_LIBS ON)
 if(STATIC)
-  set(Boost_USE_STATIC_LIBS ON)
   set(Boost_USE_STATIC_RUNTIME ON)
 endif()
 find_package(Boost 1.70 QUIET REQUIRED COMPONENTS chrono context coroutine filesystem program_options regex serialization thread)
 
+# Verify Boost thread library compatibility.
+# When semi-static linking is enabled, our Boost_THREAD_LIBRARY will be .a
+# while xfo-core's cached value is .so — this is expected and safe since
+# they come from the same Boost installation.
 if (NOT (Boost_THREAD_LIBRARY STREQUAL monero_Boost_THREAD_LIBRARY_RELEASE))
-  message(STATUS "Found Boost_THREAD_LIBRARY: ${Boost_THREAD_LIBRARY}")
-  message(STATUS "Found monero_Boost_THREAD_LIBRARY_RELEASE: ${monero_Boost_THREAD_LIBRARY_RELEASE}")
-  message(FATAL_ERROR "Boost libraries for monero build differs from this project")
+  # Extract base names without extension to compare the actual library identity
+  get_filename_component(_lws_boost_dir "${Boost_THREAD_LIBRARY}" DIRECTORY)
+  get_filename_component(_core_boost_dir "${monero_Boost_THREAD_LIBRARY_RELEASE}" DIRECTORY)
+  if (NOT (_lws_boost_dir STREQUAL _core_boost_dir))
+    message(STATUS "Found Boost_THREAD_LIBRARY: ${Boost_THREAD_LIBRARY}")
+    message(STATUS "Found monero_Boost_THREAD_LIBRARY_RELEASE: ${monero_Boost_THREAD_LIBRARY_RELEASE}")
+    message(FATAL_ERROR "Boost libraries for monero build differs from this project")
+  else()
+    message(STATUS "Boost thread library: static/dynamic variant difference (same directory) — OK")
+  endif()
+  unset(_lws_boost_dir)
+  unset(_core_boost_dir)
 endif()
 
 if (WITH_RMQ)
