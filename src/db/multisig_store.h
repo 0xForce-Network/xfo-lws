@@ -16,6 +16,18 @@ namespace lws { namespace db
     std::string context;
   };
 
+  struct multisig_wallet_record
+  {
+    std::string wallet_id;
+    std::string address;
+    std::string context;         // "miner_stake" | "task_payment"
+    std::uint32_t threshold;
+    std::uint32_t total;
+    std::vector<std::string> participants;
+    std::string status;          // "initializing" | "active" | "locked" | "closed"
+    std::uint64_t created_at;    // Unix timestamp ms
+  };
+
   struct multisig_address_data
   {
     std::string address;
@@ -27,6 +39,7 @@ namespace lws { namespace db
   class multisig_store
   {
     std::map<std::string, multisig_address_data> data_;
+    std::vector<multisig_wallet_record> wallets_;
     std::string storage_path_;
     mutable std::mutex mu_;
 
@@ -39,6 +52,10 @@ namespace lws { namespace db
       std::uint64_t amount,
       const std::string& context
     );
+
+    bool register_wallet(const multisig_wallet_record& wallet);
+
+    std::vector<multisig_wallet_record> list_wallets() const;
 
     multisig_address_data get_balance(const std::string& address) const;
 

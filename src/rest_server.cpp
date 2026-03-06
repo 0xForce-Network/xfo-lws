@@ -1586,6 +1586,64 @@ namespace lws
       }
     };
 
+    struct multisig_list_wallets
+    {
+      using request = rpc::multisig_list_wallets_request;
+      using response = rpc::multisig_list_wallets_response;
+
+      static expect<response> handle(const request&, connection_data& data, std::function<async_complete>&&)
+      {
+        const auto wallets = data.global->multisig.list_wallets();
+
+        response out{};
+        out.wallets.reserve(wallets.size());
+        for (const auto& w : wallets)
+        {
+          const auto balance = data.global->multisig.get_balance(w.address);
+          out.wallets.push_back(rpc::multisig_wallet_entry{
+            w.wallet_id,
+            w.address,
+            w.context,
+            w.threshold,
+            w.total,
+            w.participants,
+            w.status,
+            balance.total_locked,
+            static_cast<std::uint32_t>(balance.transactions.size()),
+            w.created_at
+          });
+        }
+        return out;
+      }
+    };
+
+    struct multisig_register_wallet_handler
+    {
+      using request = rpc::multisig_register_wallet_request;
+      using response = rpc::multisig_register_wallet_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        if (req.wallet_id.empty() || req.address.empty())
+          return response{false, "wallet_id and address are required"};
+
+        db::multisig_wallet_record record{};
+        record.wallet_id = req.wallet_id;
+        record.address = req.address;
+        record.context = req.context;
+        record.threshold = req.threshold;
+        record.total = req.total;
+        record.participants = req.participants;
+        record.status = req.status;
+        record.created_at = req.created_at;
+
+        if (!data.global->multisig.register_wallet(record))
+          return response{false, "Failed to register wallet"};
+
+        return response{true, "Wallet registered successfully"};
+      }
+    };
+
     struct provision_subaddrs
     {
       using request = rpc::provision_subaddrs_request;
@@ -1999,9 +2057,11 @@ namespace lws
       {"/get_version",           call<get_version>,            1024, false},
       {"/import_wallet_request", call<import_request>,     2 * 1024, false},
       {"/login",                 call<login>,              2 * 1024, false},
-      {"/multisig/balance",      call<multisig_balance>,   2 * 1024, false},
-      {"/multisig/register_tx",  call<multisig_register>,  4 * 1024, false},
-      {"/multisig/transactions", call<multisig_txs>,       2 * 1024, false},
+      {"/multisig/balance",          call<multisig_balance>,                  2 * 1024, false},
+      {"/multisig/register_tx",      call<multisig_register>,                 4 * 1024, false},
+      {"/multisig/register_wallet",  call<multisig_register_wallet_handler>,  4 * 1024, false},
+      {"/multisig/transactions",     call<multisig_txs>,                      2 * 1024, false},
+      {"/multisig/wallets",          call<multisig_list_wallets>,             1024,     false},
       {"/provision_subaddrs",    call<provision_subaddrs>, 2 * 1024, false},
       {"/submit_raw_tx",         call<submit_raw_tx>,    512 * 1024,  true},
       {"/upsert_subaddrs",       call<upsert_subaddrs>,   10 * 1024, false}
