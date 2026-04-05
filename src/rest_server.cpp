@@ -64,6 +64,7 @@
 #include "common/expect.h"         // monero/src
 #include "config.h"
 #include "crypto/crypto.h"         // monero/src
+#include "cryptonote_basic/cryptonote_format_utils.h" // monero/src
 #include "cryptonote_config.h"     // monero/src
 #include "db/data.h"
 #include "db/multisig_store.h"
@@ -89,6 +90,7 @@
 #include "util/gamma_picker.h"
 #include "util/random_outputs.h"
 #include "util/source_location.h"
+#include "util/transactions.h"
 #include "wire/adapted/crypto.h"
 #include "wire/json.h"
 
@@ -251,6 +253,129 @@ namespace lws
       if (verify != creds.address.view_public)
         return false;
       return true;
+    }
+
+    expect<std::uint64_t> decode_registered_multisig_amount(
+      const rpc::client& client,
+      const db::account_address& address,
+      const crypto::hash& tx_hash,
+      const crypto::secret_key& tx_secret_key
+    )
+    {
+      using get_transactions_rpc = cryptonote::rpc::GetTransactions;
+
+      auto rpc_client = client.clone();
+      if (!rpc_client)
+        return rpc_client.error();
+
+      get_transactions_rpc::Request tx_req{};
+      tx_req.tx_hashes.push_back(tx_hash);
+
+      MONERO_CHECK(rpc_client->send(
+        rpc::client::make_message("get_transactions", tx_req),
+        std::chrono::seconds{10}
+      ));
+
+      auto tx_raw = rpc_client->get_message(std::chrono::seconds{15});
+      if (!tx_raw)
+        return tx_raw.error();
+
+      get_transactions_rpc::Response tx_resp{};
+      MONERO_CHECK(rpc::parse_response(tx_resp, std::move(*tx_raw)));
+
+      if (std::find(tx_resp.missed_hashes.begin(), tx_resp.missed_hashes.end(), tx_hash) != tx_resp.missed_hashes.end())
+        return {lws::error::bad_daemon_response};
+
+      const auto tx_it = tx_resp.txs.find(tx_hash);
+      if (tx_it == tx_resp.txs.end())
+        return {lws::error::bad_daemon_response};
+
+      const cryptonote::transaction& tx = tx_it->second.transaction;
+
+      cryptonote::tx_extra_pub_key tx_pub_key{};
+      cryptonote::tx_extra_additional_pub_keys additional_tx_pub_keys{};
+      {
+        std::vector<cryptonote::tx_extra_field> extra{};
+        cryptonote::parse_tx_extra(tx.extra, extra);
+        if (!cryptonote::find_tx_extra_field_by_type(extra, tx_pub_key))
+          return {lws::error::bad_daemon_response};
+        cryptonote::find_tx_extra_field_by_type(extra, additional_tx_pub_keys);
+      }
+
+      crypto::key_derivation base_derivation{};
+      if (!crypto::generate_key_derivation(tx_pub_key.pub_key, tx_secret_key, base_derivation))
+        return {lws::error::crypto_failure};
+
+      std::vector<crypto::key_derivation> additional_derivations{};
+      if (additional_tx_pub_keys.data.size() == tx.vout.size())
+      {
+        additional_derivations.resize(tx.vout.size());
+        for (std::size_t index = 0; index < tx.vout.size(); ++index)
+        {
+          if (!crypto::generate_key_derivation(additional_tx_pub_keys.data[index], tx_secret_key, additional_derivations[index]))
+            return {lws::error::crypto_failure};
+        }
+      }
+
+      std::uint64_t decoded_total = 0;
+      bool matched_output = false;
+      for (std::size_t index = 0; index < tx.vout.size(); ++index)
+      {
+        crypto::public_key out_pub_key{};
+        if (!cryptonote::get_output_public_key(tx.vout[index], out_pub_key))
+          continue;
+
+        std::array<std::reference_wrapper<const crypto::key_derivation>, 2> candidates{{
+          std::cref(base_derivation),
+          std::cref(base_derivation)
+        }};
+        std::size_t candidate_count = 1;
+        if (!additional_derivations.empty())
+        {
+          candidates[1] = std::cref(additional_derivations[index]);
+          candidate_count = 2;
+        }
+
+        for (std::size_t candidate = 0; candidate < candidate_count; ++candidate)
+        {
+          const crypto::key_derivation& active_derivation = candidates[candidate].get();
+          crypto::public_key expected_out_pub{};
+          if (!crypto::derive_public_key(active_derivation, index, address.spend_public, expected_out_pub))
+            return {lws::error::crypto_failure};
+
+          if (expected_out_pub != out_pub_key)
+            continue;
+
+          matched_output = true;
+          std::uint64_t amount = tx.vout[index].amount;
+          if (!amount && 1 < tx.version)
+          {
+            if (tx.rct_signatures.outPk.size() <= index || tx.rct_signatures.ecdhInfo.size() <= index)
+              return {lws::error::bad_daemon_response};
+
+            const bool bulletproof2 = (rct::RCTTypeBulletproof2 <= tx.rct_signatures.type);
+            const auto decrypted = lws::decode_amount(
+              tx.rct_signatures.outPk[index].mask,
+              tx.rct_signatures.ecdhInfo[index],
+              active_derivation,
+              index,
+              bulletproof2
+            );
+            if (!decrypted)
+              return {lws::error::bad_daemon_response};
+            amount = decrypted->first;
+          }
+
+          if (std::numeric_limits<std::uint64_t>::max() - decoded_total < amount)
+            return {lws::error::bad_daemon_response};
+          decoded_total += amount;
+          break;
+        }
+      }
+
+      if (!matched_output)
+        return {lws::error::not_enough_amount};
+      return decoded_total;
     }
 
     //! \return Account info from the DB, iff key matches address AND address is NOT hidden.
@@ -1542,16 +1667,38 @@ namespace lws
         if (!parsed)
           return response{false, "Invalid multisig address", 0};
 
+        crypto::hash tx_hash{};
+        if (!epee::string_tools::hex_to_pod(req.tx_hash, tx_hash))
+          return response{false, "Invalid tx_hash format", 0};
+
         crypto::secret_key tx_secret_key{};
         if (!epee::string_tools::hex_to_pod(req.tx_key, tx_secret_key))
           return response{false, "Invalid tx_key format", 0};
 
-        // TODO(phase6): query chain and decrypt exact output amount with tx_key.
-        constexpr std::uint64_t decoded_amount = 0;
-        if (!data.global->multisig.register_tx(req.multisig_address, req.tx_hash, decoded_amount, req.context))
-          return response{false, "Failed to register transaction", 0};
+        const auto decoded_amount = decode_registered_multisig_amount(
+          data.global->client,
+          *parsed,
+          tx_hash,
+          tx_secret_key
+        );
+        if (!decoded_amount)
+          return response{false, "Failed to decode registered amount", 0};
+        if (*decoded_amount == 0)
+          return response{false, "Decoded amount is zero for target multisig address", 0};
 
-        return response{true, "Transaction registered successfully", decoded_amount};
+        const std::string normalized_tx_hash = epee::string_tools::pod_to_hex(tx_hash);
+        const auto inserted = data.global->multisig.register_tx_ex(
+          req.multisig_address,
+          normalized_tx_hash,
+          *decoded_amount,
+          req.context
+        );
+        if (inserted == db::multisig_store::register_tx_result::inserted)
+          return response{true, "Transaction registered successfully", *decoded_amount};
+        if (inserted == db::multisig_store::register_tx_result::duplicate)
+          return response{true, "Transaction already registered", *decoded_amount};
+
+        return response{false, "Failed to register transaction", 0};
       }
     };
 
@@ -1751,6 +1898,15 @@ namespace lws
         daemon_req.relay = true;
         daemon_req.tx_as_hex = std::move(req.tx);
 
+        const auto& tx_hex = daemon_req.tx_as_hex;
+        const std::size_t preview_len = std::min<std::size_t>(64, tx_hex.size());
+        MINFO("/submit_raw_tx received: tx_hex_len=" << tx_hex.size()
+              << " tx_bytes=" << (tx_hex.size() / 2)
+              << " prefix=" << tx_hex.substr(0, preview_len)
+              << " suffix=" << (tx_hex.size() > preview_len ? tx_hex.substr(tx_hex.size() - preview_len) : tx_hex));
+        MINFO("/submit_raw_tx preparing daemon call: method=send_raw_tx_hex relay=" << daemon_req.relay
+              << " payload_size=" << tx_hex.size());
+
         epee::byte_slice msg = rpc::client::make_message("send_raw_tx_hex", daemon_req);
 
         static cached_result cache;
@@ -1782,6 +1938,7 @@ namespace lws
               if (error)
               {
                 // Prevent further resumers, ZMQ REQ/REP in bad state
+                MERROR("/submit_raw_tx ZMQ/IO error: " << error.message());
                 MERROR("Failure in /submit_raw_tx: " << error.message());
                 value = {lws::error::daemon_timeout};
                 cache.status.reset();
@@ -1868,15 +2025,29 @@ namespace lws
 
                 {
                   transaction_rpc::Response daemon_resp{};
+                  const std::string daemon_raw_response = self.in;
+                  MINFO("/submit_raw_tx daemon raw response (" << daemon_raw_response.size() << " bytes): "
+                        << daemon_raw_response.substr(0, 1024));
                   const expect<void> status =
                     rpc::parse_response(daemon_resp, std::move(self.in));
 
                   if (!status)
+                  {
+                    MWARNING("/submit_raw_tx BRANCH[parse_failed]: " << status.error().message()
+                             << " | raw_response_preview=" << daemon_raw_response.substr(0, 512));
                     send_response({}, status.error());
+                  }
                   else if (!daemon_resp.relayed)
+                  {
+                    MWARNING("/submit_raw_tx BRANCH[relay_rejected]: relayed=" << daemon_resp.relayed
+                             << " | raw_response=" << daemon_raw_response.substr(0, 512));
                     send_response({}, {lws::error::tx_relay_failed});
+                  }
                   else
+                  {
+                    MINFO("/submit_raw_tx BRANCH[success]: relayed=true");
                     send_response({}, json_response(async_response{"OK"}));
+                  }
                 }
               }
             }

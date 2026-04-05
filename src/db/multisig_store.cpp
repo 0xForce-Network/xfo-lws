@@ -193,7 +193,7 @@ namespace lws { namespace db
     load();
   }
 
-  bool multisig_store::register_tx(
+  multisig_store::register_tx_result multisig_store::register_tx_ex(
     const std::string& address,
     const std::string& tx_hash,
     const std::uint64_t amount,
@@ -201,7 +201,7 @@ namespace lws { namespace db
   )
   {
     if (address.empty() || tx_hash.empty())
-      return false;
+      return register_tx_result::invalid_input;
 
     const std::uint64_t now =
       std::uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
@@ -216,11 +216,11 @@ namespace lws { namespace db
     for (const auto& tx : slot.transactions)
     {
       if (tx.tx_hash == tx_hash)
-        return false;
+        return register_tx_result::duplicate;
     }
 
     if (std::numeric_limits<std::uint64_t>::max() - slot.total_locked < amount)
-      return false;
+      return register_tx_result::overflow;
 
     slot.transactions.push_back(multisig_tx_record{tx_hash, amount, now, context});
     slot.total_locked += amount;
@@ -233,10 +233,20 @@ namespace lws { namespace db
     }
     catch (...)
     {
-      return false;
+      return register_tx_result::io_error;
     }
 
-    return true;
+    return register_tx_result::inserted;
+  }
+
+  bool multisig_store::register_tx(
+    const std::string& address,
+    const std::string& tx_hash,
+    const std::uint64_t amount,
+    const std::string& context
+  )
+  {
+    return register_tx_ex(address, tx_hash, amount, context) == register_tx_result::inserted;
   }
 
   bool multisig_store::register_wallet(const multisig_wallet_record& wallet)

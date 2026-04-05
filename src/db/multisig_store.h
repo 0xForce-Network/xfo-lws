@@ -44,7 +44,23 @@ namespace lws { namespace db
     mutable std::mutex mu_;
 
   public:
+    enum class register_tx_result
+    {
+      inserted,
+      duplicate,
+      invalid_input,
+      overflow,
+      io_error
+    };
+
     explicit multisig_store(const std::string& storage_path);
+
+    register_tx_result register_tx_ex(
+      const std::string& address,
+      const std::string& tx_hash,
+      std::uint64_t amount,
+      const std::string& context
+    );
 
     bool register_tx(
       const std::string& address,
