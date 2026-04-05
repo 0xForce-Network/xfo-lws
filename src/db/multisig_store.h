@@ -47,6 +47,7 @@ namespace lws { namespace db
     enum class register_tx_result
     {
       inserted,
+      updated,
       duplicate,
       invalid_input,
       overflow,

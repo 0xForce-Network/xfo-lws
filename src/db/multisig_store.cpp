@@ -213,10 +213,36 @@ namespace lws { namespace db
     if (slot.address.empty())
       slot.address = address;
 
-    for (const auto& tx : slot.transactions)
+    for (auto& tx : slot.transactions)
     {
       if (tx.tx_hash == tx_hash)
+      {
+        if (tx.amount == 0 && amount > 0)
+        {
+          if (std::numeric_limits<std::uint64_t>::max() - slot.total_locked < amount)
+            return register_tx_result::overflow;
+
+          tx.amount = amount;
+          if (tx.context.empty())
+            tx.context = context;
+          slot.total_locked += amount;
+          if (slot.primary_context.empty())
+            slot.primary_context = context;
+
+          try
+          {
+            save_locked(storage_path_, data_, wallets_);
+          }
+          catch (...)
+          {
+            return register_tx_result::io_error;
+          }
+
+          return register_tx_result::updated;
+        }
+
         return register_tx_result::duplicate;
+      }
     }
 
     if (std::numeric_limits<std::uint64_t>::max() - slot.total_locked < amount)

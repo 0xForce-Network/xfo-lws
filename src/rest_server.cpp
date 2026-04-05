@@ -1695,6 +1695,8 @@ namespace lws
         );
         if (inserted == db::multisig_store::register_tx_result::inserted)
           return response{true, "Transaction registered successfully", *decoded_amount};
+        if (inserted == db::multisig_store::register_tx_result::updated)
+          return response{true, "Transaction amount backfilled successfully", *decoded_amount};
         if (inserted == db::multisig_store::register_tx_result::duplicate)
           return response{true, "Transaction already registered", *decoded_amount};
 
