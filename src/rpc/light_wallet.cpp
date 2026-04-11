@@ -56,6 +56,7 @@
 namespace
 {
   using max_subaddrs = wire::max_element_count<16384>;
+  using max_key_images = wire::max_element_count<4096>;
 
   enum class iso_timestamp : std::uint64_t {};
 
@@ -419,6 +420,34 @@ namespace lws
       WIRE_FIELD_COPY(new_request),
       WIRE_FIELD_COPY(request_fulfilled),
       WIRE_FIELD_COPY(lookahead)
+    );
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, import_key_image& self)
+  {
+    wire::object(source,
+      wire::field("key_image", std::ref(self.key_image)),
+      WIRE_OPTIONAL_FIELD(output_index)
+    );
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, import_key_images_request& self)
+  {
+    std::string address;
+    wire::object(source,
+      wire::field("address", std::ref(address)),
+      wire::field("view_key", std::ref(unwrap(unwrap(self.creds.key)))),
+      WIRE_FIELD_ARRAY(key_images, max_key_images)
+    );
+    convert_address(address, self.creds.address);
+  }
+
+  void rpc::write_bytes(wire::json_writer& dest, const import_key_images_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD_COPY(imported),
+      WIRE_FIELD_COPY(confirmed_spends),
+      WIRE_FIELD_COPY(unconfirmed)
     );
   }
 

@@ -279,6 +279,30 @@ namespace rpc
   };
   void write_bytes(wire::json_writer&, const import_response&);
 
+  struct import_key_image
+  {
+    crypto::key_image key_image;
+    boost::optional<safe_uint64> output_index;
+  };
+  void read_bytes(wire::json_reader&, import_key_image&);
+
+  struct import_key_images_request
+  {
+    import_key_images_request() = delete;
+    account_credentials creds;
+    std::vector<import_key_image> key_images;
+  };
+  void read_bytes(wire::json_reader&, import_key_images_request&);
+
+  struct import_key_images_response
+  {
+    import_key_images_response() = delete;
+    safe_uint64 imported;
+    safe_uint64 confirmed_spends;
+    safe_uint64 unconfirmed;
+  };
+  void write_bytes(wire::json_writer&, const import_key_images_response&);
+
 
   struct login_request
   {

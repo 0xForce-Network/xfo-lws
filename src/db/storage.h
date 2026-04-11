@@ -53,6 +53,7 @@ namespace db
     MONERO_CURSOR(outputs);
     MONERO_CURSOR(spends);
     MONERO_CURSOR(images);
+    MONERO_CURSOR(confirmed_spends);
     MONERO_CURSOR(requests);
     MONERO_CURSOR(subaddress_ranges);
     MONERO_CURSOR(subaddress_indexes);
@@ -152,6 +153,10 @@ namespace db
     expect<lmdb::value_stream<db::key_image, cursor::close_images>>
       get_images(output_id id, cursor::images cur = nullptr) noexcept;
 
+    //! \return All imported confirmed spend key images associated with `id`.
+    expect<lmdb::value_stream<crypto::key_image, cursor::close_confirmed_spends>>
+      get_confirmed_spend_images(account_id id, cursor::confirmed_spends cur = nullptr) noexcept;
+
     //! \return All `request_info`s.
     expect<lmdb::key_stream<request, request_info, cursor::close_requests>>
       get_requests(cursor::requests cur = nullptr) noexcept;
@@ -192,6 +197,12 @@ namespace db
     {}
 
   public:
+    struct import_key_images_result
+    {
+      std::uint64_t imported;
+      std::uint64_t confirmed_spends;
+      std::uint64_t unconfirmed;
+    };
 
     //! \return A single instance of compiled-in checkpoints for lws
     static cryptonote::checkpoints const& get_checkpoints();
@@ -313,6 +324,10 @@ namespace db
       */
     expect<std::vector<subaddress_dict>>
       upsert_subaddresses(account_id id, const account_address& address, const crypto::secret_key& view_key, std::vector<subaddress_dict> subaddrs, std::uint32_t max_subaddresses);
+
+    //! Persist imported key images for an account and report confirmation stats.
+    expect<import_key_images_result>
+      import_key_images(account_id id, epee::span<const crypto::key_image> images);
 
     /*! Update lookahead where `match` was a matching subaddress on-chain.
       \return The number of new subaddresses added via lookahead, or -1 if

@@ -57,6 +57,7 @@
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <set>
 #include <string>
 #include <utility>
 
@@ -205,6 +206,24 @@ namespace lws
     };
     using async_complete = void(expect<copyable_slice>);
 
+    struct key_image_less
+    {
+      bool operator()(const crypto::key_image& lhs, const crypto::key_image& rhs) const noexcept
+      {
+        return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(crypto::key_image)) < 0;
+      }
+    };
+
+    struct output_id_less
+    {
+      bool operator()(const db::output_id& lhs, const db::output_id& rhs) const noexcept
+      {
+        if (lhs.high != rhs.high)
+          return lhs.high < rhs.high;
+        return lhs.low < rhs.low;
+      }
+    };
+
     bool is_locked(std::uint64_t unlock_time, db::block_id last, db::block_id tx_height) noexcept
     {
       if (unlock_time > CRYPTONOTE_MAX_BLOCK_NUMBER)
@@ -212,23 +231,6 @@ namespace lws
       if (unlock_time > to_uint(last) - 1 + CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_BLOCKS)
         return true;
       return to_uint(tx_height) + CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE > to_uint(last);
-    }
-
-    std::vector<db::output::spend_meta_>::const_iterator
-    find_metadata(std::vector<db::output::spend_meta_> const& metas, db::output_id id)
-    {
-      struct by_output_id
-      {
-        bool operator()(db::output::spend_meta_ const& left, db::output_id right) const noexcept
-        {
-          return left.id < right;
-        }
-        bool operator()(db::output_id left, db::output::spend_meta_ const& right) const noexcept
-        {
-          return left < right.id;
-        }
-      };
-      return std::lower_bound(metas.begin(), metas.end(), id, by_output_id{});
     }
 
     bool is_hidden(db::account_status status) noexcept
@@ -656,6 +658,10 @@ namespace lws
         if (!spends)
           return spends.error();
 
+        auto confirmed = user->second.get_confirmed_spend_images(user->first.id);
+        if (!confirmed)
+          return confirmed.error();
+
         const expect<db::block_info> last = user->second.get_last_block();
         if (!last)
           return last.error();
@@ -668,39 +674,51 @@ namespace lws
         resp.lookahead_fail = to_uint(user->first.lookahead_fail);
         resp.lookahead = user->first.lookahead;
 
-        std::vector<db::output::spend_meta_> metas{};
-        metas.reserve(outputs->count());
+        std::vector<std::pair<db::output_id, db::output::spend_meta_>> output_meta{};
+        output_meta.reserve(outputs->count());
 
         for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
         {
           const db::output::spend_meta_ meta =
             output.get_value<MONERO_FIELD(db::output, spend_meta)>();
 
-          // these outputs will usually be in correct order post ringct
-          if (metas.empty() || metas.back().id < meta.id)
-            metas.push_back(meta);
-          else
-            metas.insert(find_metadata(metas, meta.id), meta);
+          output_meta.push_back({meta.id, meta});
 
           resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + meta.amount);
           if (is_locked(output.get_value<MONERO_FIELD(db::output, unlock_time)>(), last->id, output.get_value<MONERO_FIELD(db::output, link)>().height))
             resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + meta.amount);
         }
 
-        resp.spent_outputs.reserve(spends->count());
-        for (auto const& spend : spends->make_range())
-        {
-          const auto meta = find_metadata(metas, spend.source);
-          if (meta == metas.end() || meta->id != spend.source)
-          {
-            throw std::logic_error{
-              "Serious database error, no receive for spend"
-            };
-          }
+        std::set<crypto::key_image, key_image_less> confirmed_images{};
+        for (const auto& image : confirmed->make_range())
+          confirmed_images.insert(image);
 
-          resp.spent_outputs.push_back({*meta, spend});
-          resp.total_sent = rpc::safe_uint64(std::uint64_t(resp.total_sent) + meta->amount);
+        auto find_meta = [&output_meta] (const db::output_id& source) -> const db::output::spend_meta_*
+        {
+          for (const auto& elem : output_meta)
+          {
+            if (elem.first == source)
+              return std::addressof(elem.second);
+          }
+          return nullptr;
+        };
+
+        std::uint64_t total_sent = 0;
+        for (const auto& spend : spends->make_range())
+        {
+          if (confirmed_images.count(spend.image) == 0)
+            continue;
+
+          const auto* meta = find_meta(spend.source);
+          if (!meta)
+            continue;
+
+          if (std::numeric_limits<std::uint64_t>::max() - total_sent < meta->amount)
+            return {lws::error::bad_daemon_response};
+          total_sent += meta->amount;
+          resp.spent_outputs.push_back(rpc::transaction_spend{*meta, spend});
         }
+        resp.total_sent = rpc::safe_uint64(total_sent);
 
         // `get_rates()` nevers does I/O, so handler can remain synchronous
         resp.rates = data.global->client.get_rates();
@@ -731,6 +749,10 @@ namespace lws
         if (!spends)
           return spends.error();
 
+        auto confirmed = user->second.get_confirmed_spend_images(user->first.id);
+        if (!confirmed)
+          return confirmed.error();
+
         const expect<db::block_info> last = user->second.get_last_block();
         if (!last)
           return last.error();
@@ -744,94 +766,121 @@ namespace lws
         resp.lookahead_fail = to_uint(user->first.lookahead_fail);
         resp.lookahead = user->first.lookahead;
 
-        // merge input and output info into a single set of txes.
-
         auto output = outputs->make_iterator();
-        auto spend = spends->make_iterator();
-
-        std::vector<db::output::spend_meta_> metas{};
+        std::vector<std::pair<db::output_id, std::size_t>> output_to_tx{};
+        output_to_tx.reserve(outputs->count());
+        std::vector<std::pair<db::output_id, db::output::spend_meta_>> output_meta{};
+        output_meta.reserve(outputs->count());
 
         resp.transactions.reserve(outputs->count());
-        metas.reserve(resp.transactions.capacity());
-
         db::transaction_link next_output{};
-        db::transaction_link next_spend{};
 
         if (!output.is_end())
           next_output = output.get_value<MONERO_FIELD(db::output, link)>();
-        if (!spend.is_end())
-          next_spend = spend.get_value<MONERO_FIELD(db::spend, link)>();
 
-        while (!output.is_end() || !spend.is_end())
+        while (!output.is_end())
         {
           if (!resp.transactions.empty())
           {
             db::transaction_link const& last = resp.transactions.back().info.link;
 
-            if ((!output.is_end() && next_output < last) || (!spend.is_end() && next_spend < last))
+            if (next_output < last)
             {
               throw std::logic_error{"DB has unexpected sort order"};
             }
           }
 
-          if (spend.is_end() || (!output.is_end() && next_output <= next_spend))
+          std::uint64_t amount = 0;
+          if (resp.transactions.empty() || resp.transactions.back().info.link.tx_hash != next_output.tx_hash)
           {
-            std::uint64_t amount = 0;
-            if (resp.transactions.empty() || resp.transactions.back().info.link.tx_hash != next_output.tx_hash)
-            {
-              resp.transactions.push_back({*output});
-              amount = resp.transactions.back().info.spend_meta.amount;
-            }
-            else
-            {
-              amount = output.get_value<MONERO_FIELD(db::output, spend_meta.amount)>();
-              resp.transactions.back().info.spend_meta.amount += amount;
-            }
-
-            const db::output::spend_meta_ meta = output.get_value<MONERO_FIELD(db::output, spend_meta)>();
-            if (metas.empty() || metas.back().id < meta.id)
-              metas.push_back(meta);
-            else
-              metas.insert(find_metadata(metas, meta.id), meta);
-
-            resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + amount);
-
-            ++output;
-            if (!output.is_end())
-              next_output = output.get_value<MONERO_FIELD(db::output, link)>();
+            resp.transactions.push_back({*output});
+            amount = resp.transactions.back().info.spend_meta.amount;
           }
-          else if (output.is_end() || (next_spend < next_output))
+          else
           {
-            const db::output_id source_id = spend.get_value<MONERO_FIELD(db::spend, source)>();
-            const auto meta = find_metadata(metas, source_id);
-            if (meta == metas.end() || meta->id != source_id)
-            {
-              throw std::logic_error{
-                "Serious database error, no receive for spend"
-              };
-            }
-
-            if (resp.transactions.empty() || resp.transactions.back().info.link.tx_hash != next_spend.tx_hash)
-            {
-              resp.transactions.push_back({});
-              resp.transactions.back().spends.push_back({*meta, *spend});
-              resp.transactions.back().info.link.height = resp.transactions.back().spends.back().possible_spend.link.height;
-              resp.transactions.back().info.link.tx_hash = resp.transactions.back().spends.back().possible_spend.link.tx_hash;
-              resp.transactions.back().info.spend_meta.mixin_count =
-                resp.transactions.back().spends.back().possible_spend.mixin_count;
-              resp.transactions.back().info.timestamp = resp.transactions.back().spends.back().possible_spend.timestamp;
-              resp.transactions.back().info.unlock_time = resp.transactions.back().spends.back().possible_spend.unlock_time;
-            }
-            else
-              resp.transactions.back().spends.push_back({*meta, *spend});
-
-            resp.transactions.back().spent += meta->amount;
-
-            ++spend;
-            if (!spend.is_end())
-              next_spend = spend.get_value<MONERO_FIELD(db::spend, link)>();
+            amount = output.get_value<MONERO_FIELD(db::output, spend_meta.amount)>();
+            resp.transactions.back().info.spend_meta.amount += amount;
           }
+
+          resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + amount);
+
+          const auto meta = output.get_value<MONERO_FIELD(db::output, spend_meta)>();
+          output_meta.push_back({meta.id, meta});
+          output_to_tx.push_back({meta.id, resp.transactions.size() - 1});
+
+          ++output;
+          if (!output.is_end())
+            next_output = output.get_value<MONERO_FIELD(db::output, link)>();
         }
+
+        std::set<crypto::key_image, key_image_less> confirmed_images{};
+        for (const auto& image : confirmed->make_range())
+          confirmed_images.insert(image);
+
+        auto find_meta = [&output_meta] (const db::output_id& source) -> const db::output::spend_meta_*
+        {
+          for (const auto& elem : output_meta)
+          {
+            if (elem.first == source)
+              return std::addressof(elem.second);
+          }
+          return nullptr;
+        };
+
+        auto find_tx_index = [&resp] (const crypto::hash& tx_hash) -> boost::optional<std::size_t>
+        {
+          for (std::size_t index = 0; index < resp.transactions.size(); ++index)
+          {
+            if (resp.transactions[index].info.link.tx_hash == tx_hash)
+              return index;
+          }
+          return boost::none;
+        };
+
+        for (const auto& spend : spends->make_range())
+        {
+          if (confirmed_images.count(spend.image) == 0)
+            continue;
+
+          const auto* meta = find_meta(spend.source);
+          if (!meta)
+            continue;
+
+          auto tx_index = find_tx_index(spend.link.tx_hash);
+          if (!tx_index)
+          {
+            db::output outgoing{};
+            outgoing.link = spend.link;
+            outgoing.spend_meta = *meta;
+            outgoing.spend_meta.amount = 0;
+            outgoing.spend_meta.mixin_count = spend.mixin_count;
+            outgoing.timestamp = spend.timestamp;
+            outgoing.unlock_time = spend.unlock_time;
+            outgoing.extra = db::pack(static_cast<db::extra>(0), spend.length);
+            outgoing.payment_id.long_ = spend.payment_id;
+            outgoing.fee = 0;
+            outgoing.recipient = spend.sender;
+
+            resp.transactions.push_back({std::move(outgoing), {}, 0});
+            tx_index = resp.transactions.size() - 1;
+          }
+
+          auto& tx = resp.transactions.at(*tx_index);
+          if (std::numeric_limits<std::uint64_t>::max() - tx.spent < meta->amount)
+            return {lws::error::bad_daemon_response};
+          tx.spent += meta->amount;
+          tx.spends.push_back(rpc::transaction_spend{*meta, spend});
+        }
+
+        std::sort(
+          resp.transactions.begin(),
+          resp.transactions.end(),
+          [] (const rpc::get_address_txs_response::transaction& left,
+              const rpc::get_address_txs_response::transaction& right)
+          {
+            return left.info.link < right.info.link;
+          }
+        );
 
         return resp;
       }
@@ -1228,6 +1277,25 @@ namespace lws
         if (!outputs)
           return outputs.error();
 
+        auto spends = user->second.get_spends(user->first.id);
+        if (!spends)
+          return spends.error();
+
+        auto confirmed = user->second.get_confirmed_spend_images(user->first.id);
+        if (!confirmed)
+          return confirmed.error();
+
+        std::set<crypto::key_image, key_image_less> confirmed_images{};
+        for (const auto& image : confirmed->make_range())
+          confirmed_images.insert(image);
+
+        std::set<db::output_id, output_id_less> confirmed_sources{};
+        for (const auto& spend : spends->make_range())
+        {
+          if (confirmed_images.count(spend.image) != 0)
+            confirmed_sources.insert(spend.source);
+        }
+
         std::uint64_t received = 0;
         std::vector<std::pair<db::output, std::vector<crypto::key_image>>> unspent;
 
@@ -1235,6 +1303,8 @@ namespace lws
         for (db::output const& out : outputs->make_range())
         {
           if (out.spend_meta.amount < std::uint64_t(*req.dust_threshold) || out.spend_meta.mixin_count < *req.mixin)
+            continue;
+          if (confirmed_sources.count(out.spend_meta.id) != 0)
             continue;
 
           received += out.spend_meta.amount;
@@ -1564,6 +1634,36 @@ namespace lws
         const char* status = new_request ?
           "Accepted, waiting for approval" : (fulfilled ? "Approved" : "Waiting for Approval");
         return response{rpc::safe_uint64(0), status, lookahead, new_request, fulfilled};
+      }
+    };
+
+    struct import_key_images
+    {
+      using request = rpc::import_key_images_request;
+      using response = rpc::import_key_images_response;
+
+      static expect<response> handle(request req, connection_data& data, std::function<async_complete>&&)
+      {
+        auto user = open_account(req.creds, data.global->disk.clone());
+        if (!user)
+          return user.error();
+
+        data.passed_login = true;
+
+        std::vector<crypto::key_image> key_images{};
+        key_images.reserve(req.key_images.size());
+        for (const auto& key_image : req.key_images)
+          key_images.push_back(key_image.key_image);
+
+        auto result = data.global->disk.clone().import_key_images(user->first.id, epee::to_span(key_images));
+        if (!result)
+          return result.error();
+
+        return response{
+          rpc::safe_uint64(result->imported),
+          rpc::safe_uint64(result->confirmed_spends),
+          rpc::safe_uint64(result->unconfirmed)
+        };
       }
     };
 
@@ -2228,6 +2328,7 @@ namespace lws
       {"/get_txt_records",       nullptr,                         0, false},
       {"/get_unspent_outs",      call<get_unspent_outs>,   2 * 1024,  true},
       {"/get_version",           call<get_version>,            1024, false},
+      {"/import_key_images",     call<import_key_images>, 64 * 1024, false},
       {"/import_wallet_request", call<import_request>,     2 * 1024, false},
       {"/login",                 call<login>,              2 * 1024, false},
       {"/multisig/balance",          call<multisig_balance>,                  2 * 1024, false},
