@@ -70,7 +70,7 @@ namespace
 
   struct expand_outputs
   {
-    const std::pair<lws::db::output, std::vector<crypto::key_image>>& data;
+    const lws::rpc::get_unspent_outs_response::unspent_output& data;
     const crypto::secret_key& user_key;
   };
 } // anonymous
@@ -111,22 +111,22 @@ namespace
 
     rct_bytes rct{};
     rct_bytes const* optional_rct = nullptr;
-    const auto flags = unpack(self.data.first.extra).first;
+    const auto flags = unpack(self.data.meta.extra).first;
     if (flags & lws::db::ringct_output)
     {
       if (!(flags & lws::db::coinbase_output))
       {
         crypto::key_derivation derived;
-        if (!crypto::generate_key_derivation(self.data.first.spend_meta.tx_public, self.user_key, derived))
+        if (!crypto::generate_key_derivation(self.data.meta.spend_meta.tx_public, self.user_key, derived))
           MONERO_THROW(lws::error::crypto_failure, "generate_key_derivation failed");
 
         crypto::secret_key scalar;
-        rct::ecdhTuple encrypted{self.data.first.ringct_mask, rct::d2h(self.data.first.spend_meta.amount)};
+        rct::ecdhTuple encrypted{self.data.meta.ringct_mask, rct::d2h(self.data.meta.spend_meta.amount)};
 
-        crypto::derivation_to_scalar(derived, self.data.first.spend_meta.index, scalar);
+        crypto::derivation_to_scalar(derived, self.data.meta.spend_meta.index, scalar);
         rct::ecdhEncode(encrypted, rct::sk2rct(scalar), false);
 
-        rct.commitment = rct::commit(self.data.first.spend_meta.amount, self.data.first.ringct_mask);
+        rct.commitment = rct::commit(self.data.meta.spend_meta.amount, self.data.meta.ringct_mask);
         rct.mask = encrypted.mask;
         rct.amount = encrypted.amount;
       }
@@ -137,19 +137,20 @@ namespace
     }
 
     wire::object(dest,
-      wire::field("amount", lws::rpc::safe_uint64(self.data.first.spend_meta.amount)),
-      wire::field("public_key", self.data.first.pub),
-      wire::field("index", self.data.first.spend_meta.index),
-      wire::field("global_index", self.data.first.spend_meta.id.low),
-      wire::field("tx_id", self.data.first.spend_meta.id.low),
-      wire::field("tx_hash", std::cref(self.data.first.link.tx_hash)),
-      wire::field("tx_prefix_hash", std::cref(self.data.first.tx_prefix_hash)),
-      wire::field("tx_pub_key", self.data.first.spend_meta.tx_public),
-      wire::field("timestamp", iso_timestamp(self.data.first.timestamp)),
-      wire::field("height", self.data.first.link.height),
-      wire::field("spend_key_images", std::cref(self.data.second)),
+      wire::field("amount", lws::rpc::safe_uint64(self.data.meta.spend_meta.amount)),
+      wire::field("public_key", self.data.meta.pub),
+      wire::field("index", self.data.meta.spend_meta.index),
+      wire::field("global_index", self.data.meta.spend_meta.id.low),
+      wire::field("tx_id", self.data.meta.spend_meta.id.low),
+      wire::field("tx_hash", std::cref(self.data.meta.link.tx_hash)),
+      wire::field("tx_prefix_hash", std::cref(self.data.meta.tx_prefix_hash)),
+      wire::field("tx_pub_key", self.data.meta.spend_meta.tx_public),
+      wire::field("timestamp", iso_timestamp(self.data.meta.timestamp)),
+      wire::field("height", self.data.meta.link.height),
+      wire::field("spend_key_images", std::cref(self.data.spend_key_images)),
+      wire::field("additional_tx_pub_keys", wire::array(std::cref(self.data.additional_tx_pub_keys))),
       wire::optional_field("rct", optional_rct),
-      wire::field("recipient", std::cref(self.data.first.recipient))
+      wire::field("recipient", std::cref(self.data.meta.recipient))
     );
   }
 
@@ -356,7 +357,7 @@ namespace lws
   }
   void rpc::write_bytes(wire::json_writer& dest, const get_unspent_outs_response& self)
   {
-    const auto expand = [&self] (const std::pair<db::output, std::vector<crypto::key_image>>& src)
+    const auto expand = [&self] (const get_unspent_outs_response::unspent_output& src)
     {
       return expand_outputs{src, self.user_key};
     };

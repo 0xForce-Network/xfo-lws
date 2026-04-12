@@ -313,11 +313,27 @@ LWS_CASE("lws::scanner::sync and lws::scanner::run")
     const auto sub1_secret = hw.get_subaddress_secret_key(keys.m_view_secret_key, cryptonote::subaddress_index{0, 1});
     const auto sub2_secret = hw.get_subaddress_secret_key(keys.m_view_secret_key, cryptonote::subaddress_index{0, 2});
 
-    sc_add(to_bytes(keys_subaddr1.m_spend_secret_key), to_bytes(sub1_secret), to_bytes(keys.m_spend_secret_key));
-    sc_add(to_bytes(keys_subaddr1.m_view_secret_key), to_bytes(keys_subaddr1.m_spend_secret_key), to_bytes(keys.m_view_secret_key));
+    sc_add(
+      reinterpret_cast<unsigned char*>(&keys_subaddr1.m_spend_secret_key),
+      reinterpret_cast<const unsigned char*>(&sub1_secret),
+      reinterpret_cast<const unsigned char*>(&keys.m_spend_secret_key)
+    );
+    sc_add(
+      reinterpret_cast<unsigned char*>(&keys_subaddr1.m_view_secret_key),
+      reinterpret_cast<const unsigned char*>(&keys_subaddr1.m_spend_secret_key),
+      reinterpret_cast<const unsigned char*>(&keys.m_view_secret_key)
+    );
 
-    sc_add(to_bytes(keys_subaddr2.m_spend_secret_key), to_bytes(sub2_secret), to_bytes(keys.m_spend_secret_key));
-    sc_add(to_bytes(keys_subaddr2.m_view_secret_key), to_bytes(keys_subaddr2.m_spend_secret_key), to_bytes(keys.m_view_secret_key));
+    sc_add(
+      reinterpret_cast<unsigned char*>(&keys_subaddr2.m_spend_secret_key),
+      reinterpret_cast<const unsigned char*>(&sub2_secret),
+      reinterpret_cast<const unsigned char*>(&keys.m_spend_secret_key)
+    );
+    sc_add(
+      reinterpret_cast<unsigned char*>(&keys_subaddr2.m_view_secret_key),
+      reinterpret_cast<const unsigned char*>(&keys_subaddr2.m_spend_secret_key),
+      reinterpret_cast<const unsigned char*>(&keys.m_view_secret_key)
+    );
   } 
 
   cryptonote::account_keys keys2{};

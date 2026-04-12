@@ -59,6 +59,7 @@
 #include <limits>
 #include <set>
 #include <string>
+#include <unordered_map>
 #include <utility>
 
 #include "common/error.h"          // monero/src
@@ -224,6 +225,14 @@ namespace lws
       }
     };
 
+    struct hash_less
+    {
+      bool operator()(const crypto::hash& lhs, const crypto::hash& rhs) const noexcept
+      {
+        return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(crypto::hash)) < 0;
+      }
+    };
+
     bool is_locked(std::uint64_t unlock_time, db::block_id last, db::block_id tx_height) noexcept
     {
       if (unlock_time > CRYPTONOTE_MAX_BLOCK_NUMBER)
@@ -304,20 +313,19 @@ namespace lws
         cryptonote::find_tx_extra_field_by_type(extra, additional_tx_pub_keys);
       }
 
+      // Derivation must use the RECIPIENT's view public key, not the tx pub key.
+      // This matches wallet2::check_tx_key (L12330):
+      //   generate_key_derivation(address.m_view_public_key, tx_key, derivation)
+      // The shared secret is D = view_public * tx_secret = V * r
       crypto::key_derivation base_derivation{};
-      if (!crypto::generate_key_derivation(tx_pub_key.pub_key, tx_secret_key, base_derivation))
+      if (!crypto::generate_key_derivation(address.view_public, tx_secret_key, base_derivation))
         return {lws::error::crypto_failure};
 
+      // Note: additional_derivations require additional tx secret keys (one per output),
+      // which the API does not currently provide. For standard (non-subaddress) multisig
+      // addresses, the base_derivation alone is sufficient. If subaddress multisig support
+      // is needed in the future, the API must be extended to accept additional_tx_keys.
       std::vector<crypto::key_derivation> additional_derivations{};
-      if (additional_tx_pub_keys.data.size() == tx.vout.size())
-      {
-        additional_derivations.resize(tx.vout.size());
-        for (std::size_t index = 0; index < tx.vout.size(); ++index)
-        {
-          if (!crypto::generate_key_derivation(additional_tx_pub_keys.data[index], tx_secret_key, additional_derivations[index]))
-            return {lws::error::crypto_failure};
-        }
-      }
 
       std::uint64_t decoded_total = 0;
       bool matched_output = false;
@@ -1258,7 +1266,63 @@ namespace lws
       using async_response = rpc::get_unspent_outs_response;
       using rpc_command = cryptonote::rpc::GetFeeEstimate;
 
-      static expect<response> generate_response(request req, const expect<rpc_command::Response>& rpc, db::storage disk)
+      static expect<std::unordered_map<crypto::hash, std::vector<crypto::public_key>>> fetch_additional_tx_pub_keys(
+        const std::vector<std::pair<db::output, std::vector<crypto::key_image>>>& unspent,
+        const rpc::client& daemon_client)
+      {
+        std::set<crypto::hash, hash_less> tx_hashes_set{};
+        for (const auto& output : unspent)
+          tx_hashes_set.insert(output.first.link.tx_hash);
+
+        std::vector<crypto::hash> tx_hashes{};
+        tx_hashes.reserve(tx_hashes_set.size());
+        tx_hashes.insert(tx_hashes.end(), tx_hashes_set.begin(), tx_hashes_set.end());
+
+        if (tx_hashes.empty())
+          return {std::unordered_map<crypto::hash, std::vector<crypto::public_key>>{}};
+
+        auto rpc_client = daemon_client.clone();
+        if (!rpc_client)
+          return rpc_client.error();
+
+        cryptonote::rpc::GetTransactions::Request tx_req{};
+        tx_req.tx_hashes = tx_hashes;
+        MONERO_CHECK(rpc_client->send(rpc::client::make_message("get_transactions", tx_req), std::chrono::seconds{10}));
+
+        auto tx_raw = rpc_client->get_message(std::chrono::seconds{15});
+        if (!tx_raw)
+          return tx_raw.error();
+
+        cryptonote::rpc::GetTransactions::Response tx_resp{};
+        MONERO_CHECK(rpc::parse_response(tx_resp, std::move(*tx_raw)));
+
+        if (!tx_resp.missed_hashes.empty())
+          return {lws::error::bad_daemon_response};
+
+        std::unordered_map<crypto::hash, std::vector<crypto::public_key>> out{};
+        out.reserve(tx_hashes.size());
+        for (const crypto::hash& tx_hash : tx_hashes)
+        {
+          const auto tx_it = tx_resp.txs.find(tx_hash);
+          if (tx_it == tx_resp.txs.end())
+            return {lws::error::bad_daemon_response};
+
+          cryptonote::tx_extra_additional_pub_keys additional_tx_pub_keys{};
+          std::vector<cryptonote::tx_extra_field> extra{};
+          cryptonote::parse_tx_extra(tx_it->second.transaction.extra, extra);
+          cryptonote::find_tx_extra_field_by_type(extra, additional_tx_pub_keys);
+
+          out.emplace(tx_hash, std::move(additional_tx_pub_keys.data));
+        }
+
+        return out;
+      }
+
+      static expect<response> generate_response(
+        request req,
+        const expect<rpc_command::Response>& rpc,
+        db::storage disk,
+        const rpc::client& daemon_client)
       {
         if (!rpc)
           return rpc.error();
@@ -1319,6 +1383,25 @@ namespace lws
           std::copy(range.begin(), range.end(), std::back_inserter(unspent.back().second));
         }
 
+        auto additional_tx_pub_keys = fetch_additional_tx_pub_keys(unspent, daemon_client);
+        if (!additional_tx_pub_keys)
+          return additional_tx_pub_keys.error();
+
+        std::vector<rpc::get_unspent_outs_response::unspent_output> response_outputs{};
+        response_outputs.reserve(unspent.size());
+        for (auto& output : unspent)
+        {
+          auto tx_additional = additional_tx_pub_keys->find(output.first.link.tx_hash);
+          if (tx_additional == additional_tx_pub_keys->end())
+            return {lws::error::bad_daemon_response};
+
+          response_outputs.push_back(rpc::get_unspent_outs_response::unspent_output{
+            std::move(output.first),
+            std::move(output.second),
+            std::move(tx_additional->second)
+          });
+        }
+
         if (received < std::uint64_t(req.amount))
           return {lws::error::not_enough_amount};
 
@@ -1334,7 +1417,7 @@ namespace lws
             rpc->fee_mask,
             rpc::safe_uint64(received),
             to_uint(user->first.lookahead_fail),
-            std::move(unspent),
+            std::move(response_outputs),
             std::vector<std::uint64_t>{rpc->estimated_base_fee},
             std::move(req.creds.key)
           }
@@ -1387,7 +1470,7 @@ namespace lws
         {
           rpc_command::Response result = cache.result;
           lock.unlock();
-          return generate_response(std::move(req), std::move(result), data.global->disk.clone());
+          return generate_response(std::move(req), std::move(result), data.global->disk.clone(), data.global->client);
         }
 
         auto active = cache.status.lock();
@@ -1438,7 +1521,7 @@ namespace lws
 
             // if `value` is error, it will return immediately
             for (auto& r : resumers)
-              r.second(generate_response(std::move(r.first), value, self_->parent->disk.clone()));
+              r.second(generate_response(std::move(r.first), value, self_->parent->disk.clone(), self_->parent->client));
           }
 
           bool set_timeout(std::chrono::steady_clock::duration timeout, const bool expecting) const

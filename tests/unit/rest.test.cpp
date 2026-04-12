@@ -35,6 +35,8 @@
 #include "error.h"
 #include "hex.h" // monero/epee/contrib/include
 #include "net/http_client.h"
+#include "cryptonote_basic/cryptonote_format_utils.h" // monero/src
+#include "rpc/daemon_messages.h" // monero/src
 #include "rest_server.h"
 #include "scanner.test.h"
 
@@ -78,6 +80,14 @@ namespace
         "}}"
       }
     };
+  }
+
+  template<typename T>
+  epee::byte_slice daemon_response(const T& message)
+  {
+    rapidjson::Value id;
+    id.SetInt(0);
+    return cryptonote::rpc::FullMessage::getResponse(message, id);
   }
 
   rct_bytes get_rct_bytes(const crypto::secret_key& user_key, const crypto::public_key& tx_public, const rct::key& ringct_mask, const std::uint64_t amount, const std::uint32_t index, bool coinbase)
@@ -507,6 +517,15 @@ LWS_CASE("rest_server")
 
       std::vector<epee::byte_slice> messages;
       messages.emplace_back(get_fee_response());
+      {
+        cryptonote::rpc::GetTransactions::Response tx_response{};
+        cryptonote::rpc::transaction_info tx_info{};
+        tx_info.in_pool = false;
+        tx_info.height = 4000;
+        EXPECT(add_tx_pub_key_to_extra(tx_info.transaction, tx_public));
+        tx_response.txs.emplace(link.tx_hash, std::move(tx_info));
+        messages.emplace_back(daemon_response(tx_response));
+      }
       boost::thread server_thread(&lws_test::rpc_thread, context.zmq_context(), std::cref(messages));
       const join on_scope_exit{server_thread};
 
@@ -528,6 +547,7 @@ LWS_CASE("rest_server")
           "\"tx_pub_key\":\"" + epee::to_hex::string(epee::as_byte_span(tx_public)) + "\","
           "\"timestamp\":\"1970-01-01T01:56:40Z\","
           "\"height\":4000,"
+          "\"additional_tx_pub_keys\":[],"
           "\"rct\":\"" + epee::to_hex::string(epee::as_byte_span(ringct_expanded)) + "\","
           "\"recipient\":{\"maj_i\":2,\"min_i\":66}}"
         "],\"fees\":[40,41]}"
@@ -664,6 +684,22 @@ LWS_CASE("rest_server")
 
       std::vector<epee::byte_slice> messages;
       messages.emplace_back(get_fee_response());
+      const crypto::public_key additional_tx_pub_key = []() {
+        crypto::secret_key secret;
+        crypto::public_key out;
+        crypto::generate_keys(out, secret);
+        return out;
+      }();
+      {
+        cryptonote::rpc::GetTransactions::Response tx_response{};
+        cryptonote::rpc::transaction_info tx_info{};
+        tx_info.in_pool = false;
+        tx_info.height = 4000;
+        EXPECT(add_tx_pub_key_to_extra(tx_info.transaction, tx_public));
+        EXPECT(cryptonote::add_additional_tx_pub_keys_to_extra(tx_info.transaction.extra, {additional_tx_pub_key}));
+        tx_response.txs.emplace(link.tx_hash, std::move(tx_info));
+        messages.emplace_back(daemon_response(tx_response));
+      }
       boost::thread server_thread(&lws_test::rpc_thread, context.zmq_context(), std::cref(messages));
       const join on_scope_exit{server_thread};
 
@@ -686,6 +722,7 @@ LWS_CASE("rest_server")
           "\"timestamp\":\"1970-01-01T01:56:40Z\","
           "\"height\":4000,"
           "\"spend_key_images\":[\"" + epee::to_hex::string(epee::as_byte_span(image)) + "\"],"
+          "\"additional_tx_pub_keys\":[\"" + epee::to_hex::string(epee::as_byte_span(additional_tx_pub_key)) + "\"],"
           "\"rct\":\"" + epee::to_hex::string(epee::as_byte_span(ringct_expanded)) + "\","
           "\"recipient\":{\"maj_i\":2,\"min_i\":66}}"
         "],\"fees\":[40,41]}"

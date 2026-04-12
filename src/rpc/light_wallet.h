@@ -210,12 +210,20 @@ namespace rpc
 
   struct get_unspent_outs_response
   {
+    struct unspent_output
+    {
+      unspent_output() = delete;
+      db::output meta;
+      std::vector<crypto::key_image> spend_key_images;
+      std::vector<crypto::public_key> additional_tx_pub_keys;
+    };
+
     get_unspent_outs_response() = delete;
     std::uint64_t per_byte_fee;
     std::uint64_t fee_mask;
     safe_uint64 amount;
     std::uint64_t lookahead_fail;
-    std::vector<std::pair<db::output, std::vector<crypto::key_image>>> outputs;
+    std::vector<unspent_output> outputs;
     std::vector<std::uint64_t> fees;
     crypto::secret_key user_key;
   };
