@@ -1528,16 +1528,45 @@ namespace lws
         for (const auto& image : confirmed->make_range())
           confirmed_images.insert(image);
 
-        std::set<db::output_id, output_id_less> confirmed_sources{};
-        for (const auto& spend : spends->make_range())
+        std::vector<std::pair<db::output_id, db::output::spend_meta_>> output_meta{};
+        output_meta.reserve(outputs->count());
+        for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
         {
-          if (confirmed_images.count(spend.image) != 0)
-            confirmed_sources.insert(spend.source);
+          const db::output::spend_meta_ meta = output.get_value<MONERO_FIELD(db::output, spend_meta)>();
+          output_meta.push_back({meta.id, meta});
         }
 
+        outputs->reset();
+
+        std::vector<confirmed_spend_choice> confirmed_spend_choices{};
+        confirmed_spend_choices.reserve(confirmed_images.size());
+        for (const auto& spend : spends->make_range())
+        {
+          if (confirmed_images.count(spend.image) == 0)
+            continue;
+
+          const auto* meta = [&output_meta, &spend] () -> const db::output::spend_meta_*
+          {
+            for (const auto& elem : output_meta)
+            {
+              if (elem.first == spend.source)
+                return std::addressof(elem.second);
+            }
+            return nullptr;
+          }();
+          if (!meta)
+            continue;
+
+          select_largest_confirmed_spend_source(confirmed_spend_choices, spend, *meta);
+        }
+
+        std::set<db::output_id, output_id_less> confirmed_sources{};
+        for (const confirmed_spend_choice& choice : confirmed_spend_choices)
+          confirmed_sources.insert(choice.spend.source);
+
         std::uint64_t received = 0;
-        std::uint64_t candidate_spent_returned_amount = 0;
-        std::size_t candidate_spent_returned_count = 0;
+        std::uint64_t candidate_spent_hidden_amount = 0;
+        std::size_t candidate_spent_hidden_count = 0;
         std::uint64_t dust_or_mixin_skipped_amount = 0;
         std::size_t dust_or_mixin_skipped_count = 0;
         std::uint64_t confirmed_source_skipped_amount = 0;
@@ -1574,25 +1603,22 @@ namespace lws
           if (!images)
             return images.error();
 
-          unspent.back().second.reserve(images->count());
-          auto range = images->make_range<MONERO_FIELD(db::key_image, value)>();
-          std::copy(range.begin(), range.end(), std::back_inserter(unspent.back().second));
-
-          if (!unspent.back().second.empty())
+          const std::size_t possible_spend_images = images->count();
+          if (possible_spend_images != 0)
           {
-            ++candidate_spent_returned_count;
-            if (std::numeric_limits<std::uint64_t>::max() - candidate_spent_returned_amount < out.spend_meta.amount)
+            ++candidate_spent_hidden_count;
+            if (std::numeric_limits<std::uint64_t>::max() - candidate_spent_hidden_amount < out.spend_meta.amount)
               return {lws::error::bad_daemon_response};
-            candidate_spent_returned_amount += out.spend_meta.amount;
+            candidate_spent_hidden_amount += out.spend_meta.amount;
             if (debug && candidate_spent_samples < 8)
             {
-              MINFO("/get_unspent_outs candidate-spent returned sample[" << candidate_spent_samples << "]: tx_hash="
+              MINFO("/get_unspent_outs candidate-spent hidden sample[" << candidate_spent_samples << "]: tx_hash="
                     << epee::string_tools::pod_to_hex(out.link.tx_hash)
                     << " global_index=" << out.spend_meta.id.low
                     << " amount_bucket=" << out.spend_meta.id.high
                     << " output_index=" << out.spend_meta.index
                     << " amount=" << out.spend_meta.amount
-                    << " spend_key_images=" << unspent.back().second.size());
+                    << " possible_spend_key_images=" << possible_spend_images);
               ++candidate_spent_samples;
             }
           }
@@ -1639,8 +1665,8 @@ namespace lws
                 << " returned_amount=" << received
                 << " clean_returned_count=" << clean_returned_count
                 << " clean_returned_amount=" << clean_returned_amount
-                << " candidate_spent_returned_count=" << candidate_spent_returned_count
-                << " candidate_spent_returned_amount=" << candidate_spent_returned_amount
+                << " candidate_spent_hidden_count=" << candidate_spent_hidden_count
+                << " candidate_spent_hidden_amount=" << candidate_spent_hidden_amount
                 << " requested_amount=" << std::uint64_t(req.amount)
                 << " dust_threshold=" << std::uint64_t(*req.dust_threshold)
                 << " requested_mixin=" << std::uint64_t(*req.mixin));

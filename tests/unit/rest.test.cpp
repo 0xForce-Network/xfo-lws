@@ -721,7 +721,7 @@ LWS_CASE("rest_server")
           "\"tx_pub_key\":\"" + epee::to_hex::string(epee::as_byte_span(tx_public)) + "\","
           "\"timestamp\":\"1970-01-01T01:56:40Z\","
           "\"height\":4000,"
-          "\"spend_key_images\":[\"" + epee::to_hex::string(epee::as_byte_span(image)) + "\"],"
+          "\"spend_key_images\":[],"
           "\"additional_tx_pub_keys\":[\"" + epee::to_hex::string(epee::as_byte_span(additional_tx_pub_key)) + "\"],"
           "\"rct\":\"" + epee::to_hex::string(epee::as_byte_span(ringct_expanded)) + "\","
           "\"recipient\":{\"maj_i\":2,\"min_i\":66}}"
@@ -784,4 +784,3 @@ LWS_CASE("rest_server")
     }
   }
 }
-
