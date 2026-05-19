@@ -62,6 +62,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "byte_stream.h"          // monero/contrib/epee/include
 #include "common/error.h"          // monero/src
 #include "common/expect.h"         // monero/src
 #include "config.h"
@@ -105,6 +106,7 @@ namespace lws
     const bool disable_admin_auth;
     const bool auto_accept_creation;
     const bool auto_accept_import;
+    const bool debug;
   };
 
   struct rest_server_data
@@ -169,7 +171,7 @@ namespace lws
     struct connection_data
     {
       rest_server_data* const global; //!< Valid for lifetime of server
-      boost::beast::http::verb last_verb; 
+      boost::beast::http::verb last_verb;
       bool passed_login; //!< True iff a login via viewkey was successful
 
       explicit connection_data(rest_server_data* global) noexcept
@@ -215,6 +217,37 @@ namespace lws
       }
     };
 
+    bool key_image_equal(const crypto::key_image& lhs, const crypto::key_image& rhs) noexcept
+    {
+      return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(crypto::key_image)) == 0;
+    }
+
+    struct confirmed_spend_choice
+    {
+      db::spend spend;
+      db::output::spend_meta_ meta;
+    };
+
+    void select_largest_confirmed_spend_source(
+      std::vector<confirmed_spend_choice>& choices,
+      const db::spend& spend,
+      const db::output::spend_meta_& meta)
+    {
+      for (confirmed_spend_choice& choice : choices)
+      {
+        if (key_image_equal(choice.spend.image, spend.image))
+        {
+          if (choice.meta.amount < meta.amount)
+          {
+            choice.spend = spend;
+            choice.meta = meta;
+          }
+          return;
+        }
+      }
+      choices.push_back(confirmed_spend_choice{spend, meta});
+    }
+
     struct output_id_less
     {
       bool operator()(const db::output_id& lhs, const db::output_id& rhs) const noexcept
@@ -232,6 +265,47 @@ namespace lws
         return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(crypto::hash)) < 0;
       }
     };
+
+    bool is_ringct_output(const db::output& output) noexcept
+    {
+      return (std::uint8_t(db::unpack(output.extra).first) & std::uint8_t(db::extra::ringct_output)) != 0;
+    }
+
+    void log_unspent_output_debug(const std::size_t response_index, const db::output& output, const bool debug)
+    {
+      if (!debug)
+        return;
+
+      MINFO("/get_unspent_outs output[" << response_index << "]: tx_hash="
+            << epee::string_tools::pod_to_hex(output.link.tx_hash)
+            << " global_index=" << output.spend_meta.id.low
+            << " amount_bucket=" << output.spend_meta.id.high
+            << " index=" << output.spend_meta.index
+            << " amount=" << output.spend_meta.amount
+            << " rct=" << is_ringct_output(output));
+    }
+
+    expect<epee::byte_slice> raw_json_response(const std::string& source)
+    {
+      epee::byte_stream out{};
+      out.write(source.data(), source.size());
+      return epee::byte_slice{std::move(out)};
+    }
+
+    bool should_passthrough_submit_raw_tx_error(const std::string& daemon_raw_response, const bool debug) noexcept
+    {
+      if (!debug)
+        return false;
+
+      return daemon_raw_response.find("double spend") != std::string::npos ||
+        daemon_raw_response.find("double_spend") != std::string::npos ||
+        daemon_raw_response.find("Double spend") != std::string::npos ||
+        daemon_raw_response.find("DOUBLE_SPEND") != std::string::npos ||
+        daemon_raw_response.find("invalid input") != std::string::npos ||
+        daemon_raw_response.find("invalid_input") != std::string::npos ||
+        daemon_raw_response.find("Invalid input") != std::string::npos ||
+        daemon_raw_response.find("INVALID_INPUT") != std::string::npos;
+    }
 
     bool is_locked(std::uint64_t unlock_time, db::block_id last, db::block_id tx_height) noexcept
     {
@@ -712,21 +786,68 @@ namespace lws
         };
 
         std::uint64_t total_sent = 0;
+        std::size_t confirmed_spend_count = 0;
+        std::size_t unconfirmed_spend_count = 0;
+        std::size_t missing_source_count = 0;
+        std::size_t unconfirmed_spend_samples = 0;
+        std::vector<confirmed_spend_choice> confirmed_spend_choices{};
+        confirmed_spend_choices.reserve(confirmed_images.size());
         for (const auto& spend : spends->make_range())
         {
           if (confirmed_images.count(spend.image) == 0)
+          {
+            ++unconfirmed_spend_count;
+            if (data.global->options.debug && unconfirmed_spend_samples < 8)
+            {
+              MINFO("/get_address_info unconfirmed spend sample[" << unconfirmed_spend_samples << "]: key_image="
+                    << epee::string_tools::pod_to_hex(spend.image)
+                    << " source_global_index=" << spend.source.low
+                    << " source_amount_bucket=" << spend.source.high
+                    << " spend_tx_hash=" << epee::string_tools::pod_to_hex(spend.link.tx_hash)
+                    << " spend_height=" << db::to_uint(spend.link.height)
+                    << " mixin_count=" << spend.mixin_count);
+              ++unconfirmed_spend_samples;
+            }
             continue;
+          }
+          else
+            ++confirmed_spend_count;
 
           const auto* meta = find_meta(spend.source);
           if (!meta)
+          {
+            ++missing_source_count;
             continue;
+          }
 
-          if (std::numeric_limits<std::uint64_t>::max() - total_sent < meta->amount)
+          select_largest_confirmed_spend_source(confirmed_spend_choices, spend, *meta);
+        }
+
+        for (const confirmed_spend_choice& choice : confirmed_spend_choices)
+        {
+          if (std::numeric_limits<std::uint64_t>::max() - total_sent < choice.meta.amount)
             return {lws::error::bad_daemon_response};
-          total_sent += meta->amount;
-          resp.spent_outputs.push_back(rpc::transaction_spend{*meta, spend});
+          total_sent += choice.meta.amount;
+          resp.spent_outputs.push_back(rpc::transaction_spend{choice.meta, choice.spend});
         }
         resp.total_sent = rpc::safe_uint64(total_sent);
+
+        if (data.global->options.debug)
+        {
+          MINFO("/get_address_info balance summary: outputs=" << outputs->count()
+                << " spends=" << spends->count()
+                << " confirmed_spend_images=" << confirmed_images.size()
+                << " confirmed_spends=" << confirmed_spend_count
+                << " confirmed_spend_selected=" << confirmed_spend_choices.size()
+                << " unconfirmed_spends=" << unconfirmed_spend_count
+                << " missing_source_spends=" << missing_source_count
+                << " total_received=" << std::uint64_t(resp.total_received)
+                << " total_sent=" << std::uint64_t(resp.total_sent)
+                << " locked_funds=" << std::uint64_t(resp.locked_funds)
+                << " spent_outputs=" << resp.spent_outputs.size()
+                << " scan_height=" << std::uint64_t(user->first.scan_height)
+                << " blockchain_height=" << resp.blockchain_height);
+        }
 
         // `get_rates()` nevers does I/O, so handler can remain synchronous
         resp.rates = data.global->client.get_rates();
@@ -845,39 +966,92 @@ namespace lws
           return boost::none;
         };
 
+        std::uint64_t txs_total_sent = 0;
+        std::size_t txs_confirmed_spend_count = 0;
+        std::size_t txs_unconfirmed_spend_count = 0;
+        std::size_t txs_missing_source_count = 0;
+        std::size_t txs_outgoing_only_count = 0;
+        std::size_t txs_unconfirmed_spend_samples = 0;
+        std::vector<confirmed_spend_choice> txs_confirmed_spend_choices{};
+        txs_confirmed_spend_choices.reserve(confirmed_images.size());
         for (const auto& spend : spends->make_range())
         {
           if (confirmed_images.count(spend.image) == 0)
+          {
+            ++txs_unconfirmed_spend_count;
+            if (data.global->options.debug && txs_unconfirmed_spend_samples < 8)
+            {
+              MINFO("/get_address_txs unconfirmed spend sample[" << txs_unconfirmed_spend_samples << "]: key_image="
+                    << epee::string_tools::pod_to_hex(spend.image)
+                    << " source_global_index=" << spend.source.low
+                    << " source_amount_bucket=" << spend.source.high
+                    << " spend_tx_hash=" << epee::string_tools::pod_to_hex(spend.link.tx_hash)
+                    << " spend_height=" << db::to_uint(spend.link.height)
+                    << " mixin_count=" << spend.mixin_count);
+              ++txs_unconfirmed_spend_samples;
+            }
             continue;
+          }
+          else
+            ++txs_confirmed_spend_count;
 
           const auto* meta = find_meta(spend.source);
           if (!meta)
+          {
+            ++txs_missing_source_count;
             continue;
+          }
 
-          auto tx_index = find_tx_index(spend.link.tx_hash);
+          select_largest_confirmed_spend_source(txs_confirmed_spend_choices, spend, *meta);
+        }
+
+        for (const confirmed_spend_choice& choice : txs_confirmed_spend_choices)
+        {
+          auto tx_index = find_tx_index(choice.spend.link.tx_hash);
           if (!tx_index)
           {
             db::output outgoing{};
-            outgoing.link = spend.link;
-            outgoing.spend_meta = *meta;
+            outgoing.link = choice.spend.link;
+            outgoing.spend_meta = choice.meta;
             outgoing.spend_meta.amount = 0;
-            outgoing.spend_meta.mixin_count = spend.mixin_count;
-            outgoing.timestamp = spend.timestamp;
-            outgoing.unlock_time = spend.unlock_time;
-            outgoing.extra = db::pack(static_cast<db::extra>(0), spend.length);
-            outgoing.payment_id.long_ = spend.payment_id;
+            outgoing.spend_meta.mixin_count = choice.spend.mixin_count;
+            outgoing.timestamp = choice.spend.timestamp;
+            outgoing.unlock_time = choice.spend.unlock_time;
+            outgoing.extra = db::pack(static_cast<db::extra>(0), choice.spend.length);
+            outgoing.payment_id.long_ = choice.spend.payment_id;
             outgoing.fee = 0;
-            outgoing.recipient = spend.sender;
+            outgoing.recipient = choice.spend.sender;
 
             resp.transactions.push_back({std::move(outgoing), {}, 0});
             tx_index = resp.transactions.size() - 1;
+            ++txs_outgoing_only_count;
           }
 
           auto& tx = resp.transactions.at(*tx_index);
-          if (std::numeric_limits<std::uint64_t>::max() - tx.spent < meta->amount)
+          if (std::numeric_limits<std::uint64_t>::max() - tx.spent < choice.meta.amount)
             return {lws::error::bad_daemon_response};
-          tx.spent += meta->amount;
-          tx.spends.push_back(rpc::transaction_spend{*meta, spend});
+          tx.spent += choice.meta.amount;
+          if (std::numeric_limits<std::uint64_t>::max() - txs_total_sent < choice.meta.amount)
+            return {lws::error::bad_daemon_response};
+          txs_total_sent += choice.meta.amount;
+          tx.spends.push_back(rpc::transaction_spend{choice.meta, choice.spend});
+        }
+
+        if (data.global->options.debug)
+        {
+          MINFO("/get_address_txs summary: outputs=" << outputs->count()
+                << " spends=" << spends->count()
+                << " confirmed_spend_images=" << confirmed_images.size()
+                << " confirmed_spends=" << txs_confirmed_spend_count
+                << " confirmed_spend_selected=" << txs_confirmed_spend_choices.size()
+                << " unconfirmed_spends=" << txs_unconfirmed_spend_count
+                << " missing_source_spends=" << txs_missing_source_count
+                << " outgoing_only_txs=" << txs_outgoing_only_count
+                << " transactions_before_sort=" << resp.transactions.size()
+                << " total_received=" << std::uint64_t(resp.total_received)
+                << " total_sent_from_candidate_spends=" << txs_total_sent
+                << " scan_height=" << resp.scanned_height
+                << " blockchain_height=" << resp.blockchain_height);
         }
 
         std::sort(
@@ -1322,7 +1496,8 @@ namespace lws
         request req,
         const expect<rpc_command::Response>& rpc,
         db::storage disk,
-        const rpc::client& daemon_client)
+        const rpc::client& daemon_client,
+        const bool debug)
       {
         if (!rpc)
           return rpc.error();
@@ -1361,15 +1536,36 @@ namespace lws
         }
 
         std::uint64_t received = 0;
+        std::uint64_t candidate_spent_returned_amount = 0;
+        std::size_t candidate_spent_returned_count = 0;
+        std::uint64_t dust_or_mixin_skipped_amount = 0;
+        std::size_t dust_or_mixin_skipped_count = 0;
+        std::uint64_t confirmed_source_skipped_amount = 0;
+        std::size_t confirmed_source_skipped_count = 0;
+        std::uint64_t clean_returned_amount = 0;
+        std::size_t clean_returned_count = 0;
+        std::size_t candidate_spent_samples = 0;
         std::vector<std::pair<db::output, std::vector<crypto::key_image>>> unspent;
 
         unspent.reserve(outputs->count());
         for (db::output const& out : outputs->make_range())
         {
           if (out.spend_meta.amount < std::uint64_t(*req.dust_threshold) || out.spend_meta.mixin_count < *req.mixin)
+          {
+            ++dust_or_mixin_skipped_count;
+            if (std::numeric_limits<std::uint64_t>::max() - dust_or_mixin_skipped_amount < out.spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            dust_or_mixin_skipped_amount += out.spend_meta.amount;
             continue;
+          }
           if (confirmed_sources.count(out.spend_meta.id) != 0)
+          {
+            ++confirmed_source_skipped_count;
+            if (std::numeric_limits<std::uint64_t>::max() - confirmed_source_skipped_amount < out.spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            confirmed_source_skipped_amount += out.spend_meta.amount;
             continue;
+          }
 
           received += out.spend_meta.amount;
           unspent.push_back({out, {}});
@@ -1381,6 +1577,32 @@ namespace lws
           unspent.back().second.reserve(images->count());
           auto range = images->make_range<MONERO_FIELD(db::key_image, value)>();
           std::copy(range.begin(), range.end(), std::back_inserter(unspent.back().second));
+
+          if (!unspent.back().second.empty())
+          {
+            ++candidate_spent_returned_count;
+            if (std::numeric_limits<std::uint64_t>::max() - candidate_spent_returned_amount < out.spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            candidate_spent_returned_amount += out.spend_meta.amount;
+            if (debug && candidate_spent_samples < 8)
+            {
+              MINFO("/get_unspent_outs candidate-spent returned sample[" << candidate_spent_samples << "]: tx_hash="
+                    << epee::string_tools::pod_to_hex(out.link.tx_hash)
+                    << " global_index=" << out.spend_meta.id.low
+                    << " amount_bucket=" << out.spend_meta.id.high
+                    << " output_index=" << out.spend_meta.index
+                    << " amount=" << out.spend_meta.amount
+                    << " spend_key_images=" << unspent.back().second.size());
+              ++candidate_spent_samples;
+            }
+          }
+          else
+          {
+            ++clean_returned_count;
+            if (std::numeric_limits<std::uint64_t>::max() - clean_returned_amount < out.spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            clean_returned_amount += out.spend_meta.amount;
+          }
         }
 
         auto additional_tx_pub_keys = fetch_additional_tx_pub_keys(unspent, daemon_client);
@@ -1395,11 +1617,33 @@ namespace lws
           if (tx_additional == additional_tx_pub_keys->end())
             return {lws::error::bad_daemon_response};
 
+          log_unspent_output_debug(response_outputs.size(), output.first, debug);
           response_outputs.push_back(rpc::get_unspent_outs_response::unspent_output{
             std::move(output.first),
             std::move(output.second),
             std::move(tx_additional->second)
           });
+        }
+
+        if (debug)
+        {
+          MINFO("/get_unspent_outs selection summary: outputs=" << outputs->count()
+                << " spends=" << spends->count()
+                << " confirmed_spend_images=" << confirmed_images.size()
+                << " confirmed_sources=" << confirmed_sources.size()
+                << " confirmed_source_skipped_count=" << confirmed_source_skipped_count
+                << " confirmed_source_skipped_amount=" << confirmed_source_skipped_amount
+                << " dust_or_mixin_skipped_count=" << dust_or_mixin_skipped_count
+                << " dust_or_mixin_skipped_amount=" << dust_or_mixin_skipped_amount
+                << " returned_outputs=" << response_outputs.size()
+                << " returned_amount=" << received
+                << " clean_returned_count=" << clean_returned_count
+                << " clean_returned_amount=" << clean_returned_amount
+                << " candidate_spent_returned_count=" << candidate_spent_returned_count
+                << " candidate_spent_returned_amount=" << candidate_spent_returned_amount
+                << " requested_amount=" << std::uint64_t(req.amount)
+                << " dust_threshold=" << std::uint64_t(*req.dust_threshold)
+                << " requested_mixin=" << std::uint64_t(*req.mixin));
         }
 
         if (received < std::uint64_t(req.amount))
@@ -1470,7 +1714,7 @@ namespace lws
         {
           rpc_command::Response result = cache.result;
           lock.unlock();
-          return generate_response(std::move(req), std::move(result), data.global->disk.clone(), data.global->client);
+          return generate_response(std::move(req), std::move(result), data.global->disk.clone(), data.global->client, data.global->options.debug);
         }
 
         auto active = cache.status.lock();
@@ -1521,7 +1765,7 @@ namespace lws
 
             // if `value` is error, it will return immediately
             for (auto& r : resumers)
-              r.second(generate_response(std::move(r.first), value, self_->parent->disk.clone(), self_->parent->client));
+              r.second(generate_response(std::move(r.first), value, self_->parent->disk.clone(), self_->parent->client, self_->parent->options.debug));
           }
 
           bool set_timeout(std::chrono::steady_clock::duration timeout, const bool expecting) const
@@ -1732,15 +1976,131 @@ namespace lws
           return user.error();
 
         data.passed_login = true;
+        const db::account account = user->first;
+        MINFO("/import_key_images begin: account_id=" << unsigned(account.id)
+              << " key_images=" << req.key_images.size()
+              << " debug=" << data.global->options.debug
+              << " initial_reader_active=1");
+
+        struct import_key_image_debug
+        {
+          crypto::key_image key_image;
+          boost::optional<rpc::safe_uint64> output_index;
+          boost::optional<db::output_id> known_source;
+          bool before_spent;
+        };
+
+        std::vector<import_key_image_debug> debug_rows{};
+        if (data.global->options.debug)
+        {
+          std::set<crypto::key_image, key_image_less> confirmed_before{};
+          {
+            auto confirmed = user->second.get_confirmed_spend_images(account.id);
+            if (!confirmed)
+              return confirmed.error();
+            for (const auto& image : confirmed->make_range())
+              confirmed_before.insert(image);
+          }
+
+          std::vector<std::pair<crypto::key_image, db::output_id>> known_spend_sources{};
+          {
+            auto spends = user->second.get_spends(account.id);
+            if (!spends)
+              return spends.error();
+            known_spend_sources.reserve(spends->count());
+            for (const auto& spend : spends->make_range())
+              known_spend_sources.push_back({spend.image, spend.source});
+          }
+
+          debug_rows.reserve(req.key_images.size());
+          for (const auto& key_image : req.key_images)
+          {
+            boost::optional<db::output_id> known_source{};
+            for (const auto& known : known_spend_sources)
+            {
+              if (key_image_equal(known.first, key_image.key_image))
+              {
+                known_source = known.second;
+                break;
+              }
+            }
+
+            debug_rows.push_back(import_key_image_debug{
+              key_image.key_image,
+              key_image.output_index,
+              known_source,
+              confirmed_before.count(key_image.key_image) != 0
+            });
+          }
+        }
 
         std::vector<crypto::key_image> key_images{};
         key_images.reserve(req.key_images.size());
         for (const auto& key_image : req.key_images)
           key_images.push_back(key_image.key_image);
 
-        auto result = data.global->disk.clone().import_key_images(user->first.id, epee::to_span(key_images));
+        user->second.finish_read();
+
+        MINFO("/import_key_images before_write: account_id=" << unsigned(account.id)
+              << " key_images=" << key_images.size()
+              << " initial_reader_active=0");
+        auto result = data.global->disk.clone().import_key_images(account.id, epee::to_span(key_images));
         if (!result)
+        {
+          MERROR("/import_key_images write_failed: account_id=" << unsigned(account.id)
+                 << " key_images=" << key_images.size()
+                 << " error=" << result.error().message()
+                 << " initial_reader_active=0");
           return result.error();
+        }
+        MINFO("/import_key_images after_write: account_id=" << unsigned(account.id)
+              << " imported=" << std::uint64_t(result->imported)
+              << " confirmed_spends=" << std::uint64_t(result->confirmed_spends)
+              << " unconfirmed=" << std::uint64_t(result->unconfirmed)
+              << " initial_reader_active=0");
+
+        if (data.global->options.debug)
+        {
+          MINFO("/import_key_images before_after_read: account_id=" << unsigned(account.id)
+                << " initial_reader_active=0");
+          auto after_user = open_account(req.creds, data.global->disk.clone());
+          if (!after_user)
+          {
+            MERROR("/import_key_images after_read_failed: account_id=" << unsigned(account.id)
+                   << " error=" << after_user.error().message()
+                   << " initial_reader_active=0");
+            return after_user.error();
+          }
+
+          std::set<crypto::key_image, key_image_less> confirmed_after{};
+          {
+            auto confirmed = after_user->second.get_confirmed_spend_images(after_user->first.id);
+            if (!confirmed)
+              return confirmed.error();
+            for (const auto& image : confirmed->make_range())
+              confirmed_after.insert(image);
+          }
+          after_user->second.finish_read();
+
+          for (std::size_t index = 0; index < debug_rows.size(); ++index)
+          {
+            const auto& row = debug_rows[index];
+            MINFO("/import_key_images key_image[" << index << "]: key_image="
+                  << epee::string_tools::pod_to_hex(row.key_image)
+                  << " output_index=" << (row.output_index ? std::to_string(std::uint64_t(*row.output_index)) : std::string{"null"})
+                  << " known_spend=" << bool(row.known_source)
+                  << " known_source_global_index=" << (row.known_source ? std::to_string(row.known_source->low) : std::string{"null"})
+                  << " known_source_amount_bucket=" << (row.known_source ? std::to_string(row.known_source->high) : std::string{"null"})
+                  << " before_spent=" << row.before_spent
+                  << " after_spent=" << (confirmed_after.count(row.key_image) != 0));
+          }
+
+          MINFO("/import_key_images summary: requested=" << req.key_images.size()
+                << " unique_confirmed_after=" << confirmed_after.size()
+                << " imported=" << std::uint64_t(result->imported)
+                << " confirmed_spends=" << std::uint64_t(result->confirmed_spends)
+                << " unconfirmed=" << std::uint64_t(result->unconfirmed));
+        }
 
         return response{
           rpc::safe_uint64(result->imported),
@@ -2000,7 +2360,7 @@ namespace lws
         const std::uint32_t n_major = req.n_maj.value_or(50);
         const std::uint32_t n_minor = req.n_min.value_or(500);
         const bool get_all = req.get_all.value_or(true);
- 
+
         std::vector<db::subaddress_dict> new_ranges;
         std::vector<db::subaddress_dict> all_ranges;
         if (n_major && n_minor)
@@ -2083,14 +2443,17 @@ namespace lws
         daemon_req.relay = true;
         daemon_req.tx_as_hex = std::move(req.tx);
 
-        const auto& tx_hex = daemon_req.tx_as_hex;
-        const std::size_t preview_len = std::min<std::size_t>(64, tx_hex.size());
-        MINFO("/submit_raw_tx received: tx_hex_len=" << tx_hex.size()
-              << " tx_bytes=" << (tx_hex.size() / 2)
-              << " prefix=" << tx_hex.substr(0, preview_len)
-              << " suffix=" << (tx_hex.size() > preview_len ? tx_hex.substr(tx_hex.size() - preview_len) : tx_hex));
-        MINFO("/submit_raw_tx preparing daemon call: method=send_raw_tx_hex relay=" << daemon_req.relay
-              << " payload_size=" << tx_hex.size());
+        if (data.global->options.debug)
+        {
+          const auto& tx_hex = daemon_req.tx_as_hex;
+          const std::size_t preview_len = std::min<std::size_t>(64, tx_hex.size());
+          MINFO("/submit_raw_tx received: tx_hex_len=" << tx_hex.size()
+                << " tx_bytes=" << (tx_hex.size() / 2)
+                << " prefix=" << tx_hex.substr(0, preview_len)
+                << " suffix=" << (tx_hex.size() > preview_len ? tx_hex.substr(tx_hex.size() - preview_len) : tx_hex));
+          MINFO("/submit_raw_tx preparing daemon call: method=send_raw_tx_hex relay=" << daemon_req.relay
+                << " payload_size=" << tx_hex.size());
+        }
 
         epee::byte_slice msg = rpc::client::make_message("send_raw_tx_hex", daemon_req);
 
@@ -2211,26 +2574,46 @@ namespace lws
                 {
                   transaction_rpc::Response daemon_resp{};
                   const std::string daemon_raw_response = self.in;
-                  MINFO("/submit_raw_tx daemon raw response (" << daemon_raw_response.size() << " bytes): "
-                        << daemon_raw_response.substr(0, 1024));
+                  if (self.parent->options.debug)
+                    MINFO("/submit_raw_tx daemon raw response (" << daemon_raw_response.size() << " bytes): "
+                          << daemon_raw_response.substr(0, 1024));
                   const expect<void> status =
                     rpc::parse_response(daemon_resp, std::move(self.in));
 
                   if (!status)
                   {
-                    MWARNING("/submit_raw_tx BRANCH[parse_failed]: " << status.error().message()
-                             << " | raw_response_preview=" << daemon_raw_response.substr(0, 512));
-                    send_response({}, status.error());
+                    if (self.parent->options.debug)
+                      MWARNING("/submit_raw_tx BRANCH[parse_failed]: " << status.error().message()
+                               << " | raw_response_preview=" << daemon_raw_response.substr(0, 512));
+                    if (should_passthrough_submit_raw_tx_error(daemon_raw_response, self.parent->options.debug))
+                    {
+                      MWARNING("/submit_raw_tx passthrough daemon error body after parse failure");
+                      send_response({}, raw_json_response(daemon_raw_response));
+                    }
+                    else
+                    {
+                      send_response({}, status.error());
+                    }
                   }
                   else if (!daemon_resp.relayed)
                   {
-                    MWARNING("/submit_raw_tx BRANCH[relay_rejected]: relayed=" << daemon_resp.relayed
-                             << " | raw_response=" << daemon_raw_response.substr(0, 512));
-                    send_response({}, {lws::error::tx_relay_failed});
+                    if (self.parent->options.debug)
+                      MWARNING("/submit_raw_tx BRANCH[relay_rejected]: relayed=" << daemon_resp.relayed
+                               << " | raw_response=" << daemon_raw_response.substr(0, 512));
+                    if (should_passthrough_submit_raw_tx_error(daemon_raw_response, self.parent->options.debug))
+                    {
+                      MWARNING("/submit_raw_tx passthrough daemon relay rejection body");
+                      send_response({}, raw_json_response(daemon_raw_response));
+                    }
+                    else
+                    {
+                      send_response({}, {lws::error::tx_relay_failed});
+                    }
                   }
                   else
                   {
-                    MINFO("/submit_raw_tx BRANCH[success]: relayed=true");
+                    if (self.parent->options.debug)
+                      MINFO("/submit_raw_tx BRANCH[success]: relayed=true");
                     send_response({}, json_response(async_response{"OK"}));
                   }
                 }
@@ -2307,7 +2690,7 @@ namespace lws
         throw std::logic_error{"async REST handler not setup properly"};
       if (std::is_same<epee::byte_slice, response>() && !resume)
         throw std::logic_error{"async REST handler not setup properly"};
- 
+
       request req{};
       if (!std::is_empty<request>())
       {
@@ -2349,7 +2732,7 @@ namespace lws
 
       if (data.last_verb != boost::beast::http::verb::post)
         return {error::bad_verb};
-      
+
       admin<request> req{};
       {
         const std::error_code error = wire::json::from_bytes(std::move(root), req);
@@ -2883,7 +3266,7 @@ namespace lws
   }
 
   rest_server::rest_server(epee::span<const std::string> addresses, std::vector<std::string> admin, db::storage disk, rpc::client client, configuration config)
-    : global_(std::make_unique<rest_server_data>(std::move(disk), std::move(client), runtime_options{config.max_subaddresses, config.webhook_verify, config.disable_admin_auth, config.auto_accept_creation, config.auto_accept_import})),
+    : global_(std::make_unique<rest_server_data>(std::move(disk), std::move(client), runtime_options{config.max_subaddresses, config.webhook_verify, config.disable_admin_auth, config.auto_accept_creation, config.auto_accept_import, config.debug})),
       ports_(),
       workers_()
   {

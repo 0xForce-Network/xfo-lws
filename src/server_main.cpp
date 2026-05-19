@@ -87,6 +87,7 @@ namespace
     const command_line::arg_descriptor<bool> regtest;
     const command_line::arg_descriptor<bool> version;
     const command_line::arg_descriptor<bool> auto_accept_import;
+    const command_line::arg_descriptor<bool> debug;
     const command_line::arg_descriptor<bool> block_depth_threading;
     const command_line::arg_descriptor<std::uint64_t> min_block_depth;
     const command_line::arg_descriptor<double> split_sync_threads;
@@ -142,6 +143,7 @@ namespace
       , regtest{"regtest", "Run in a regression testing mode", false}
       , version{"version", "Display version and quit", false}
       , auto_accept_import{"auto-accept-import", "Account import requests are automatically accepted", false}
+      , debug{"debug", "Enable LWS transaction debugging logs for spend/output diagnosis and submit_raw_tx daemon responses", false}
       , block_depth_threading{"block-depth-threading", "Balance thread workload by block depth instead of account count", false}
       , min_block_depth{"min-block-depth", "Minimum block depth for block depth threading (defaults to 16)", lws::MINIMUM_BLOCK_DEPTH}
       , split_sync_threads{"split-sync-threads", "Percentage of threads to use for fully synced accounts (0-1, requires --block-depth-threading, 0 to disable)", 0.0}
@@ -185,6 +187,7 @@ namespace
       command_line::add_arg(description, regtest);
       command_line::add_arg(description, version);
       command_line::add_arg(description, auto_accept_import);
+      command_line::add_arg(description, debug);
       command_line::add_arg(description, block_depth_threading);
       command_line::add_arg(description, min_block_depth);
       command_line::add_arg(description, split_sync_threads);
@@ -274,7 +277,8 @@ namespace
     }
 
     opts.set_network(args); // do this first, sets global variable :/
-    mlog_set_log_level(command_line::get_arg(args, opts.log_level));
+    const bool debug_enabled = command_line::get_arg(args, opts.debug);
+    mlog_set_log_level(debug_enabled ? 4 : command_line::get_arg(args, opts.log_level));
 
     const auto webhook_verify_raw = command_line::get_arg(args, opts.webhook_ssl_verification);
     epee::net_utils::ssl_verification_t webhook_verify = epee::net_utils::ssl_verification_t::none;
@@ -293,12 +297,13 @@ namespace
         {command_line::get_arg(args, opts.rest_ssl_key), command_line::get_arg(args, opts.rest_ssl_cert)},
         command_line::get_arg(args, opts.access_controls),
         command_line::get_arg(args, opts.rest_threads),
-	      command_line::get_arg(args, opts.max_subaddresses),
+        command_line::get_arg(args, opts.max_subaddresses),
         webhook_verify,
         command_line::get_arg(args, opts.external_bind),
         command_line::get_arg(args, opts.disable_admin_auth),
         command_line::get_arg(args, opts.auto_accept_creation),
-        command_line::get_arg(args, opts.auto_accept_import)
+        command_line::get_arg(args, opts.auto_accept_import),
+        debug_enabled
       },
       command_line::get_arg(args, opts.daemon_rpc),
       command_line::get_arg(args, opts.daemon_sub),
@@ -364,6 +369,8 @@ namespace
     MINFO("Using monerod ZMQ RPC at " << ctx.daemon_address());
     if (!sub_address.empty())
       MINFO("Using monerod ZMQ sub at " << sub_address);
+    if (prog.rest_config.debug)
+      MINFO("LWS debug diagnostics enabled via --debug");
 
     auto client = scanner.sync(ctx.connect().value(), prog.untrusted_daemon).value();
 

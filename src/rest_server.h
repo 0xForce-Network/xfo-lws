@@ -67,6 +67,7 @@ namespace lws
       bool disable_admin_auth;
       bool auto_accept_creation;
       bool auto_accept_import;
+      bool debug;
     };
 
     explicit rest_server(epee::span<const std::string> addresses, std::vector<std::string> admin, db::storage disk, rpc::client client, configuration config);

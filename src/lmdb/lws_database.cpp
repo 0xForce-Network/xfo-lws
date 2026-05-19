@@ -27,6 +27,7 @@
 #include "lws_database.h"
 #include "lmdb/error.h"
 #include "lmdb/util.h"
+#include "misc_log_ex.h"
 
 #ifdef _WIN32
 namespace
@@ -87,6 +88,10 @@ namespace lws_lmdb
             if (!err && txn != nullptr)
                 return lmdb::write_txn{txn};
 
+            const std::error_code code{lmdb::error(err)};
+            MERROR("lmdb transaction begin failed: flags=" << flags
+                   << " err=" << err
+                   << " message=" << code.message());
             release_context(ctx);
             if (err != MDB_MAP_RESIZED)
                 return {lmdb::error(err)};
@@ -137,6 +142,9 @@ namespace lws_lmdb
             const int err = mdb_txn_renew(txn.get());
             if (err)
             {
+                const std::error_code code{lmdb::error(err)};
+                MERROR("lmdb read transaction renew failed: err=" << err
+                       << " message=" << code.message());
                 release_context(ctx);
                 return {lmdb::error(err)};
             }
