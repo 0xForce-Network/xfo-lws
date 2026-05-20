@@ -47,6 +47,7 @@
 #include <boost/beast/http/verb.hpp>
 #include <boost/beast/http/write.hpp>
 #include <boost/beast/version.hpp>
+#include <boost/numeric/conversion/cast.hpp>
 #include <boost/optional/optional.hpp>
 #include <boost/range/counting_range.hpp>
 #include <boost/thread/lock_guard.hpp>
@@ -54,19 +55,24 @@
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/tss.hpp>
 #include <boost/utility/string_ref.hpp>
+#include <chrono>
 #include <cstring>
 #include <functional>
 #include <limits>
+#include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 #include "byte_stream.h"          // monero/contrib/epee/include
 #include "common/error.h"          // monero/src
 #include "common/expect.h"         // monero/src
 #include "config.h"
 #include "crypto/crypto.h"         // monero/src
+#include "crypto/wallet/crypto.h"  // monero/src
 #include "cryptonote_basic/cryptonote_format_utils.h" // monero/src
 #include "cryptonote_config.h"     // monero/src
 #include "db/data.h"
@@ -85,6 +91,8 @@
 #include "rpc/admin.h"
 #include "rpc/client.h"
 #include "rpc/daemon_messages.h"   // monero/src
+#include "rpc/daemon_zmq.h"
+#include "rpc/json.h"
 #include "rpc/light_wallet.h"
 #include "rpc/multisig.h"
 #include "rpc/rates.h"
@@ -107,6 +115,9 @@ namespace lws
     const bool auto_accept_creation;
     const bool auto_accept_import;
     const bool debug;
+    const bool auto_rescan_after_key_images;
+    const std::uint64_t auto_rescan_depth;
+    const std::uint64_t auto_rescan_min_confirmed_spends;
   };
 
   struct rest_server_data
@@ -168,6 +179,67 @@ namespace lws
     constexpr const unsigned max_ring_size = 20;
     constexpr const unsigned max_rings = 150;
 
+    db::block_id select_auto_rescan_height(const db::account& account, const std::uint64_t depth) noexcept
+    {
+      if (depth == 0)
+        return account.start_height;
+      const std::uint64_t scan_height = std::uint64_t(account.scan_height);
+      const std::uint64_t target = scan_height <= depth ? 0 : scan_height - depth;
+      return db::block_id(std::max(target, std::uint64_t(account.start_height)));
+    }
+
+    void maybe_auto_rescan_after_key_images(rest_server_data& data, const db::account& account, const db::storage::import_key_images_result& result)
+    {
+      const runtime_options& options = data.options;
+      if (!options.auto_rescan_after_key_images)
+      {
+        if (options.debug)
+          MINFO("/import_key_images auto_rescan skipped: reason=disabled account_id=" << unsigned(account.id));
+        return;
+      }
+
+      if (std::uint64_t(result.imported) < options.auto_rescan_min_confirmed_spends)
+      {
+        if (options.debug)
+          MINFO("/import_key_images auto_rescan skipped: reason=imported_below_threshold account_id=" << unsigned(account.id)
+                << " imported=" << std::uint64_t(result.imported)
+                << " confirmed_spends=" << std::uint64_t(result.confirmed_spends)
+                << " exact_source_inserted=" << result.exact_source_inserted
+                << " min_confirmed_spends=" << options.auto_rescan_min_confirmed_spends);
+        return;
+      }
+
+      const db::block_id target = select_auto_rescan_height(account, options.auto_rescan_depth);
+      if (account.scan_height <= target)
+      {
+        if (options.debug)
+          MINFO("/import_key_images auto_rescan skipped: reason=already_at_or_before_target account_id=" << unsigned(account.id)
+                << " scan_height=" << std::uint64_t(account.scan_height)
+                << " target_height=" << std::uint64_t(target)
+                << " depth=" << options.auto_rescan_depth);
+        return;
+      }
+
+      const std::array<db::account_address, 1> addresses{{account.address}};
+      const auto rescanned = data.disk.clone().rescan(target, epee::to_span(addresses));
+      if (!rescanned)
+      {
+        MWARNING("/import_key_images auto_rescan failed: account_id=" << unsigned(account.id)
+                 << " from_scan_height=" << std::uint64_t(account.scan_height)
+                 << " target_height=" << std::uint64_t(target)
+                 << " error=" << rescanned.error().message());
+        return;
+      }
+
+      MINFO("/import_key_images auto_rescan triggered: account_id=" << unsigned(account.id)
+            << " from_scan_height=" << std::uint64_t(account.scan_height)
+            << " target_height=" << std::uint64_t(target)
+            << " depth=" << options.auto_rescan_depth
+            << " confirmed_spends=" << std::uint64_t(result.confirmed_spends)
+            << " imported=" << std::uint64_t(result.imported)
+            << " updated_addresses=" << rescanned->size());
+    }
+
     struct connection_data
     {
       rest_server_data* const global; //!< Valid for lifetime of server
@@ -222,31 +294,42 @@ namespace lws
       return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(crypto::key_image)) == 0;
     }
 
+    bool public_key_equal(const crypto::public_key& lhs, const crypto::public_key& rhs) noexcept
+    {
+      return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(crypto::public_key)) == 0;
+    }
+
+    constexpr const std::uint64_t pending_spend_ttl_seconds = 24 * 60 * 60;
+    constexpr const char* lws_spent_state_patch_marker = "lws-spent-state-v20260520-key-image-dedup-exact-source";
+
+    std::uint64_t unix_timestamp_now() noexcept
+    {
+      const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+      );
+      return now.count() < 0 ? 0 : std::uint64_t(now.count());
+    }
+
+    bool output_id_equal(const db::output_id& lhs, const db::output_id& rhs) noexcept
+    {
+      return lhs.high == rhs.high && lhs.low == rhs.low;
+    }
+
+    bool pending_spend_matches_output(const db::pending_spend& pending, const db::output& output) noexcept
+    {
+      return output_id_equal(pending.source, output.spend_meta.id) &&
+        pending.out_index == output.spend_meta.index &&
+        pending.tx_hash == output.link.tx_hash &&
+        public_key_equal(pending.pub, output.pub);
+    }
+
     struct confirmed_spend_choice
     {
       db::spend spend;
       db::output::spend_meta_ meta;
+      db::output_id source;
+      bool imported_source;
     };
-
-    void select_largest_confirmed_spend_source(
-      std::vector<confirmed_spend_choice>& choices,
-      const db::spend& spend,
-      const db::output::spend_meta_& meta)
-    {
-      for (confirmed_spend_choice& choice : choices)
-      {
-        if (key_image_equal(choice.spend.image, spend.image))
-        {
-          if (choice.meta.amount < meta.amount)
-          {
-            choice.spend = spend;
-            choice.meta = meta;
-          }
-          return;
-        }
-      }
-      choices.push_back(confirmed_spend_choice{spend, meta});
-    }
 
     struct output_id_less
     {
@@ -257,6 +340,75 @@ namespace lws
         return lhs.low < rhs.low;
       }
     };
+
+    bool should_replace_confirmed_spend_choice(
+      const confirmed_spend_choice& current,
+      const confirmed_spend_choice& candidate) noexcept
+    {
+      if (current.imported_source != candidate.imported_source)
+        return candidate.imported_source;
+
+      if (current.meta.amount != candidate.meta.amount)
+        return current.meta.amount < candidate.meta.amount;
+
+      const output_id_less less{};
+      return less(candidate.source, current.source);
+    }
+
+    const db::output* find_output_by_id(const std::vector<db::output>& outputs, const db::output_id& id) noexcept
+    {
+      for (const db::output& output : outputs)
+      {
+        if (output_id_equal(output.spend_meta.id, id))
+          return std::addressof(output);
+      }
+      return nullptr;
+    }
+
+    const db::output* find_output_by_imported_source(
+      const std::vector<db::output>& outputs,
+      const std::map<crypto::key_image, db::key_image_source, key_image_less>& imported_sources,
+      const crypto::key_image& image) noexcept
+    {
+      const auto source = imported_sources.find(image);
+      if (source == imported_sources.end())
+        return nullptr;
+
+      for (const db::output& output : outputs)
+      {
+        if (output_id_equal(output.spend_meta.id, source->second.source) &&
+            output.spend_meta.index == source->second.out_index &&
+            public_key_equal(output.pub, source->second.pub) &&
+            std::memcmp(std::addressof(output.link.tx_hash), std::addressof(source->second.tx_hash), sizeof(crypto::hash)) == 0)
+          return std::addressof(output);
+      }
+      return nullptr;
+    }
+
+    expect<std::vector<crypto::key_image>> get_output_spend_images(db::storage_reader& reader, const db::output_id& id)
+    {
+      auto images = reader.get_images(id);
+      if (!images)
+        return images.error();
+
+      std::vector<crypto::key_image> out{};
+      out.reserve(images->count());
+      for (const db::key_image& image : images->make_range())
+        out.push_back(image.value);
+      return out;
+    }
+
+    bool has_confirmed_spend_image(
+      const std::vector<crypto::key_image>& images,
+      const std::set<crypto::key_image, key_image_less>& confirmed_images) noexcept
+    {
+      for (const crypto::key_image& image : images)
+      {
+        if (confirmed_images.count(image) != 0)
+          return true;
+      }
+      return false;
+    }
 
     struct hash_less
     {
@@ -269,6 +421,223 @@ namespace lws
     bool is_ringct_output(const db::output& output) noexcept
     {
       return (std::uint8_t(db::unpack(output.extra).first) & std::uint8_t(db::extra::ringct_output)) != 0;
+    }
+
+    struct txpool_overlay_match
+    {
+      db::output output;
+      crypto::hash tx_hash;
+    };
+
+    bool hash_equal(const crypto::hash& lhs, const crypto::hash& rhs) noexcept
+    {
+      return std::memcmp(std::addressof(lhs), std::addressof(rhs), sizeof(crypto::hash)) == 0;
+    }
+
+    bool output_exists_in_rows(const std::vector<db::output>& rows, const txpool_overlay_match& match) noexcept
+    {
+      for (const db::output& output : rows)
+      {
+        if (hash_equal(output.link.tx_hash, match.output.link.tx_hash) && output.spend_meta.index == match.output.spend_meta.index)
+          return true;
+      }
+      return false;
+    }
+
+    expect<std::vector<txpool_overlay_match>> fetch_txpool_incoming_overlay(
+      const db::account& account,
+      const rpc::client& daemon_client,
+      const bool debug)
+    {
+      auto rpc_client = daemon_client.clone();
+      if (!rpc_client)
+        return rpc_client.error();
+
+      cryptonote::rpc::GetTransactionPool::Request txpool_req{};
+      MONERO_CHECK(rpc_client->send(rpc::client::make_message("get_transaction_pool", txpool_req), std::chrono::seconds{10}));
+
+      auto txpool_raw = rpc_client->get_message(std::chrono::seconds{15});
+      if (!txpool_raw)
+        return txpool_raw.error();
+
+      auto txpool = rpc::parse_json_response<rpc::get_transaction_pool>(std::move(*txpool_raw));
+      if (!txpool)
+        return txpool.error();
+
+      std::vector<txpool_overlay_match> matches{};
+      std::size_t inspected_outputs = 0;
+      std::size_t matched_outputs = 0;
+      const std::uint64_t now = unix_timestamp_now();
+      crypto::secret_key view_key{};
+      static_assert(sizeof(view_key) == sizeof(account.key), "different size keys");
+      std::memcpy(std::addressof(unwrap(unwrap(view_key))), std::addressof(account.key), sizeof(view_key));
+      for (const auto& tx_entry : txpool->transactions)
+      {
+        const cryptonote::transaction& tx = tx_entry.tx;
+        if (2 < tx.version)
+          continue;
+
+        cryptonote::tx_extra_pub_key key{};
+        cryptonote::tx_extra_nonce extra_nonce{};
+        cryptonote::tx_extra_additional_pub_keys additional_tx_pub_keys{};
+        {
+          std::vector<cryptonote::tx_extra_field> extra{};
+          cryptonote::parse_tx_extra(tx.extra, extra);
+          if (!cryptonote::find_tx_extra_field_by_type(extra, key))
+            continue;
+          cryptonote::find_tx_extra_field_by_type(extra, extra_nonce);
+          cryptonote::find_tx_extra_field_by_type(extra, additional_tx_pub_keys);
+        }
+
+        crypto::key_derivation derived{};
+        if (!crypto::wallet::generate_key_derivation(key.pub_key, view_key, derived))
+          continue;
+
+        std::vector<crypto::key_derivation> additional_derivations{};
+        if (additional_tx_pub_keys.data.size() == tx.vout.size())
+        {
+          additional_derivations.resize(tx.vout.size());
+          bool additional_ok = true;
+          for (std::size_t index = 0; index < tx.vout.size(); ++index)
+          {
+            if (!crypto::wallet::generate_key_derivation(additional_tx_pub_keys.data[index], view_key, additional_derivations[index]))
+            {
+              additional_ok = false;
+              break;
+            }
+          }
+          if (!additional_ok)
+            additional_derivations.clear();
+        }
+
+        db::extra ext{};
+        std::uint32_t mixin = 0;
+        for (const auto& in : tx.vin)
+        {
+          const cryptonote::txin_to_key* const in_data = boost::get<cryptonote::txin_to_key>(std::addressof(in));
+          if (in_data)
+          {
+            mixin = boost::numeric_cast<std::uint32_t>(std::max(std::size_t(1), in_data->key_offsets.size()) - 1);
+          }
+          else if (boost::get<cryptonote::txin_gen>(std::addressof(in)))
+            ext = db::extra(ext | db::coinbase_output);
+        }
+
+        for (std::size_t index = 0; index < tx.vout.size(); ++index)
+        {
+          ++inspected_outputs;
+          crypto::public_key out_pub_key{};
+          if (!cryptonote::get_output_public_key(tx.vout[index], out_pub_key))
+            continue;
+
+          boost::optional<crypto::view_tag> view_tag_opt = cryptonote::get_output_view_tag(tx.vout[index]);
+          const bool found_tag =
+            (!additional_derivations.empty() && cryptonote::out_can_be_to_acc(view_tag_opt, additional_derivations.at(index), index)) ||
+            cryptonote::out_can_be_to_acc(view_tag_opt, derived, index);
+          if (!found_tag)
+            continue;
+
+          bool found_pub = false;
+          crypto::key_derivation active_derived{};
+          crypto::public_key active_pub{};
+          for (std::size_t attempt = 0; attempt < 2; ++attempt)
+          {
+            if (attempt == 0)
+            {
+              active_derived = derived;
+              active_pub = key.pub_key;
+            }
+            else if (!additional_derivations.empty())
+            {
+              active_derived = additional_derivations.at(index);
+              active_pub = additional_tx_pub_keys.data.at(index);
+            }
+            else
+              break;
+
+            crypto::public_key derived_pub{};
+            if (!crypto::wallet::derive_subaddress_public_key(out_pub_key, active_derived, index, derived_pub))
+              continue;
+
+            if (account.address.spend_public == derived_pub)
+            {
+              found_pub = true;
+              break;
+            }
+          }
+
+          if (!found_pub)
+            continue;
+
+          std::uint64_t amount = tx.vout[index].amount;
+          rct::key mask = rct::identity();
+          db::extra output_ext = ext;
+          if (!amount && !(output_ext & db::coinbase_output) && 1 < tx.version)
+          {
+            if (tx.rct_signatures.outPk.size() <= index || tx.rct_signatures.ecdhInfo.size() <= index)
+              continue;
+            const bool bulletproof2 = (rct::RCTTypeBulletproof2 <= tx.rct_signatures.type);
+            const auto decrypted = lws::decode_amount(
+              tx.rct_signatures.outPk.at(index).mask,
+              tx.rct_signatures.ecdhInfo.at(index),
+              active_derived,
+              index,
+              bulletproof2
+            );
+            if (!decrypted)
+              continue;
+            amount = decrypted->first;
+            mask = decrypted->second;
+            output_ext = db::extra(output_ext | db::ringct_output);
+          }
+          else if (1 < tx.version)
+            output_ext = db::extra(output_ext | db::ringct_output);
+
+          db::output::payment_id_ payment_id{};
+          std::uint8_t payment_id_size = 0;
+          if (!extra_nonce.nonce.empty() && cryptonote::get_encrypted_payment_id_from_tx_extra_nonce(extra_nonce.nonce, payment_id.short_))
+          {
+            payment_id_size = sizeof(crypto::hash8);
+            lws::decrypt_payment_id(payment_id.short_, active_derived);
+          }
+
+          crypto::hash tx_prefix_hash{};
+          cryptonote::get_transaction_prefix_hash(tx, tx_prefix_hash);
+          matches.push_back(txpool_overlay_match{
+            db::output{
+              db::transaction_link{db::block_id::txpool, tx_entry.tx_hash},
+              db::output::spend_meta_{
+                db::output_id::txpool(),
+                amount,
+                mixin,
+                boost::numeric_cast<std::uint32_t>(index),
+                active_pub
+              },
+              now,
+              tx.unlock_time,
+              tx_prefix_hash,
+              out_pub_key,
+              mask,
+              {0, 0, 0, 0, 0, 0, 0},
+              db::pack(output_ext, payment_id_size),
+              payment_id,
+              cryptonote::get_tx_fee(tx),
+              db::address_index{db::major_index::primary, db::minor_index::primary}
+            },
+            tx_entry.tx_hash
+          });
+          ++matched_outputs;
+        }
+      }
+
+      if (debug)
+      {
+        MINFO("lws-txpool-overlay: account_id=" << unsigned(account.id)
+              << " txpool_txs=" << txpool->transactions.size()
+              << " inspected_outputs=" << inspected_outputs
+              << " matched_outputs=" << matched_outputs);
+      }
+      return matches;
     }
 
     void log_unspent_output_debug(const std::size_t response_index, const db::output& output, const bool debug)
@@ -744,9 +1113,20 @@ namespace lws
         if (!confirmed)
           return confirmed.error();
 
+        auto imported_sources = user->second.get_imported_spend_sources(user->first.id);
+        if (!imported_sources)
+          return imported_sources.error();
+
         const expect<db::block_info> last = user->second.get_last_block();
         if (!last)
           return last.error();
+
+        auto txpool_overlay = fetch_txpool_incoming_overlay(user->first, data.global->client, data.global->options.debug);
+        if (!txpool_overlay)
+        {
+          MWARNING("/get_address_info txpool overlay unavailable: " << txpool_overlay.error().message());
+          txpool_overlay = std::vector<txpool_overlay_match>{};
+        }
 
         resp.blockchain_height = std::uint64_t(last->id);
         resp.transaction_height = resp.blockchain_height;
@@ -756,42 +1136,51 @@ namespace lws
         resp.lookahead_fail = to_uint(user->first.lookahead_fail);
         resp.lookahead = user->first.lookahead;
 
-        std::vector<std::pair<db::output_id, db::output::spend_meta_>> output_meta{};
-        output_meta.reserve(outputs->count());
+        std::vector<db::output> output_rows{};
+        output_rows.reserve(outputs->count());
 
         for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
         {
-          const db::output::spend_meta_ meta =
-            output.get_value<MONERO_FIELD(db::output, spend_meta)>();
+          const db::output out = *output;
+          const db::output::spend_meta_ meta = out.spend_meta;
 
-          output_meta.push_back({meta.id, meta});
+          output_rows.push_back(out);
 
           resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + meta.amount);
-          if (is_locked(output.get_value<MONERO_FIELD(db::output, unlock_time)>(), last->id, output.get_value<MONERO_FIELD(db::output, link)>().height))
+          if (is_locked(out.unlock_time, last->id, out.link.height))
             resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + meta.amount);
+        }
+
+        std::size_t txpool_overlay_added = 0;
+        std::uint64_t txpool_overlay_amount = 0;
+        for (const txpool_overlay_match& match : *txpool_overlay)
+        {
+          if (output_exists_in_rows(output_rows, match))
+            continue;
+          output_rows.push_back(match.output);
+          resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + match.output.spend_meta.amount);
+          resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + match.output.spend_meta.amount);
+          if (std::numeric_limits<std::uint64_t>::max() - txpool_overlay_amount < match.output.spend_meta.amount)
+            return {lws::error::bad_daemon_response};
+          txpool_overlay_amount += match.output.spend_meta.amount;
+          ++txpool_overlay_added;
         }
 
         std::set<crypto::key_image, key_image_less> confirmed_images{};
         for (const auto& image : confirmed->make_range())
           confirmed_images.insert(image);
 
-        auto find_meta = [&output_meta] (const db::output_id& source) -> const db::output::spend_meta_*
-        {
-          for (const auto& elem : output_meta)
-          {
-            if (elem.first == source)
-              return std::addressof(elem.second);
-          }
-          return nullptr;
-        };
+        std::map<crypto::key_image, db::key_image_source, key_image_less> imported_source_map{};
+        for (const auto& source : imported_sources->make_range())
+          imported_source_map.emplace(source.image, source);
 
         std::uint64_t total_sent = 0;
         std::size_t confirmed_spend_count = 0;
         std::size_t unconfirmed_spend_count = 0;
         std::size_t missing_source_count = 0;
+        std::size_t imported_source_candidate_count = 0;
         std::size_t unconfirmed_spend_samples = 0;
-        std::vector<confirmed_spend_choice> confirmed_spend_choices{};
-        confirmed_spend_choices.reserve(confirmed_images.size());
+        std::map<crypto::key_image, confirmed_spend_choice, key_image_less> confirmed_spend_choices{};
         for (const auto& spend : spends->make_range())
         {
           if (confirmed_images.count(spend.image) == 0)
@@ -813,18 +1202,35 @@ namespace lws
           else
             ++confirmed_spend_count;
 
-          const auto* meta = find_meta(spend.source);
-          if (!meta)
+          const auto* output = find_output_by_imported_source(output_rows, imported_source_map, spend.image);
+          const bool imported_source = output != nullptr;
+          if (!output)
+            output = find_output_by_id(output_rows, spend.source);
+          if (!output)
           {
             ++missing_source_count;
             continue;
           }
+          if (imported_source)
+            ++imported_source_candidate_count;
 
-          select_largest_confirmed_spend_source(confirmed_spend_choices, spend, *meta);
+          confirmed_spend_choice choice{spend, output->spend_meta, output->spend_meta.id, imported_source};
+          const auto existing = confirmed_spend_choices.find(spend.image);
+          if (existing == confirmed_spend_choices.end())
+            confirmed_spend_choices.emplace(spend.image, std::move(choice));
+          else if (should_replace_confirmed_spend_choice(existing->second, choice))
+            existing->second = std::move(choice);
         }
 
-        for (const confirmed_spend_choice& choice : confirmed_spend_choices)
+        std::set<db::output_id, output_id_less> total_sent_sources{};
+        std::size_t imported_source_count = 0;
+        for (const auto& choice_entry : confirmed_spend_choices)
         {
+          const confirmed_spend_choice& choice = choice_entry.second;
+          if (!total_sent_sources.insert(choice.source).second)
+            continue;
+          if (choice.imported_source)
+            ++imported_source_count;
           if (std::numeric_limits<std::uint64_t>::max() - total_sent < choice.meta.amount)
             return {lws::error::bad_daemon_response};
           total_sent += choice.meta.amount;
@@ -835,15 +1241,23 @@ namespace lws
         if (data.global->options.debug)
         {
           MINFO("/get_address_info balance summary: outputs=" << outputs->count()
+                << " patch_marker=" << lws_spent_state_patch_marker
+                << " balance_policy=confirmed_spend_sources_only"
+                << " unspent_policy=not_applicable"
                 << " spends=" << spends->count()
                 << " confirmed_spend_images=" << confirmed_images.size()
                 << " confirmed_spends=" << confirmed_spend_count
                 << " confirmed_spend_selected=" << confirmed_spend_choices.size()
+                << " unique_confirmed_sources=" << total_sent_sources.size()
+                << " imported_exact_sources=" << imported_source_count
+                << " imported_exact_source_candidates=" << imported_source_candidate_count
                 << " unconfirmed_spends=" << unconfirmed_spend_count
                 << " missing_source_spends=" << missing_source_count
                 << " total_received=" << std::uint64_t(resp.total_received)
                 << " total_sent=" << std::uint64_t(resp.total_sent)
                 << " locked_funds=" << std::uint64_t(resp.locked_funds)
+                << " txpool_overlay_added=" << txpool_overlay_added
+                << " txpool_overlay_amount=" << txpool_overlay_amount
                 << " spent_outputs=" << resp.spent_outputs.size()
                 << " scan_height=" << std::uint64_t(user->first.scan_height)
                 << " blockchain_height=" << resp.blockchain_height);
@@ -882,9 +1296,20 @@ namespace lws
         if (!confirmed)
           return confirmed.error();
 
+        auto imported_sources = user->second.get_imported_spend_sources(user->first.id);
+        if (!imported_sources)
+          return imported_sources.error();
+
         const expect<db::block_info> last = user->second.get_last_block();
         if (!last)
           return last.error();
+
+        auto txpool_overlay = fetch_txpool_incoming_overlay(user->first, data.global->client, data.global->options.debug);
+        if (!txpool_overlay)
+        {
+          MWARNING("/get_address_txs txpool overlay unavailable: " << txpool_overlay.error().message());
+          txpool_overlay = std::vector<txpool_overlay_match>{};
+        }
 
         response resp{};
         resp.scanned_height = std::uint64_t(user->first.scan_height);
@@ -898,8 +1323,8 @@ namespace lws
         auto output = outputs->make_iterator();
         std::vector<std::pair<db::output_id, std::size_t>> output_to_tx{};
         output_to_tx.reserve(outputs->count());
-        std::vector<std::pair<db::output_id, db::output::spend_meta_>> output_meta{};
-        output_meta.reserve(outputs->count());
+        std::vector<db::output> output_rows{};
+        output_rows.reserve(outputs->count());
 
         resp.transactions.reserve(outputs->count());
         db::transaction_link next_output{};
@@ -933,8 +1358,8 @@ namespace lws
 
           resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + amount);
 
+          output_rows.push_back(*output);
           const auto meta = output.get_value<MONERO_FIELD(db::output, spend_meta)>();
-          output_meta.push_back({meta.id, meta});
           output_to_tx.push_back({meta.id, resp.transactions.size() - 1});
 
           ++output;
@@ -942,19 +1367,29 @@ namespace lws
             next_output = output.get_value<MONERO_FIELD(db::output, link)>();
         }
 
+        std::size_t txs_txpool_overlay_added = 0;
+        std::uint64_t txs_txpool_overlay_amount = 0;
+        for (const txpool_overlay_match& match : *txpool_overlay)
+        {
+          if (output_exists_in_rows(output_rows, match))
+            continue;
+          resp.transactions.push_back({match.output, {}, 0});
+          resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + match.output.spend_meta.amount);
+          output_rows.push_back(match.output);
+          output_to_tx.push_back({match.output.spend_meta.id, resp.transactions.size() - 1});
+          if (std::numeric_limits<std::uint64_t>::max() - txs_txpool_overlay_amount < match.output.spend_meta.amount)
+            return {lws::error::bad_daemon_response};
+          txs_txpool_overlay_amount += match.output.spend_meta.amount;
+          ++txs_txpool_overlay_added;
+        }
+
         std::set<crypto::key_image, key_image_less> confirmed_images{};
         for (const auto& image : confirmed->make_range())
           confirmed_images.insert(image);
 
-        auto find_meta = [&output_meta] (const db::output_id& source) -> const db::output::spend_meta_*
-        {
-          for (const auto& elem : output_meta)
-          {
-            if (elem.first == source)
-              return std::addressof(elem.second);
-          }
-          return nullptr;
-        };
+        std::map<crypto::key_image, db::key_image_source, key_image_less> imported_source_map{};
+        for (const auto& source : imported_sources->make_range())
+          imported_source_map.emplace(source.image, source);
 
         auto find_tx_index = [&resp] (const crypto::hash& tx_hash) -> boost::optional<std::size_t>
         {
@@ -971,9 +1406,9 @@ namespace lws
         std::size_t txs_unconfirmed_spend_count = 0;
         std::size_t txs_missing_source_count = 0;
         std::size_t txs_outgoing_only_count = 0;
+        std::size_t txs_imported_source_candidate_count = 0;
         std::size_t txs_unconfirmed_spend_samples = 0;
-        std::vector<confirmed_spend_choice> txs_confirmed_spend_choices{};
-        txs_confirmed_spend_choices.reserve(confirmed_images.size());
+        std::map<crypto::key_image, confirmed_spend_choice, key_image_less> txs_confirmed_spend_choices{};
         for (const auto& spend : spends->make_range())
         {
           if (confirmed_images.count(spend.image) == 0)
@@ -995,18 +1430,35 @@ namespace lws
           else
             ++txs_confirmed_spend_count;
 
-          const auto* meta = find_meta(spend.source);
-          if (!meta)
+          const auto* output = find_output_by_imported_source(output_rows, imported_source_map, spend.image);
+          const bool imported_source = output != nullptr;
+          if (!output)
+            output = find_output_by_id(output_rows, spend.source);
+          if (!output)
           {
             ++txs_missing_source_count;
             continue;
           }
+          if (imported_source)
+            ++txs_imported_source_candidate_count;
 
-          select_largest_confirmed_spend_source(txs_confirmed_spend_choices, spend, *meta);
+          confirmed_spend_choice choice{spend, output->spend_meta, output->spend_meta.id, imported_source};
+          const auto existing = txs_confirmed_spend_choices.find(spend.image);
+          if (existing == txs_confirmed_spend_choices.end())
+            txs_confirmed_spend_choices.emplace(spend.image, std::move(choice));
+          else if (should_replace_confirmed_spend_choice(existing->second, choice))
+            existing->second = std::move(choice);
         }
 
-        for (const confirmed_spend_choice& choice : txs_confirmed_spend_choices)
+        std::set<db::output_id, output_id_less> txs_total_sent_sources{};
+        std::size_t txs_imported_source_count = 0;
+        for (const auto& choice_entry : txs_confirmed_spend_choices)
         {
+          const confirmed_spend_choice& choice = choice_entry.second;
+          if (!txs_total_sent_sources.insert(choice.source).second)
+            continue;
+          if (choice.imported_source)
+            ++txs_imported_source_count;
           auto tx_index = find_tx_index(choice.spend.link.tx_hash);
           if (!tx_index)
           {
@@ -1040,16 +1492,24 @@ namespace lws
         if (data.global->options.debug)
         {
           MINFO("/get_address_txs summary: outputs=" << outputs->count()
+                << " patch_marker=" << lws_spent_state_patch_marker
+                << " balance_policy=confirmed_spend_sources_only"
+                << " unspent_policy=not_applicable"
                 << " spends=" << spends->count()
                 << " confirmed_spend_images=" << confirmed_images.size()
                 << " confirmed_spends=" << txs_confirmed_spend_count
                 << " confirmed_spend_selected=" << txs_confirmed_spend_choices.size()
+                << " unique_confirmed_sources=" << txs_total_sent_sources.size()
+                << " imported_exact_sources=" << txs_imported_source_count
+                << " imported_exact_source_candidates=" << txs_imported_source_candidate_count
                 << " unconfirmed_spends=" << txs_unconfirmed_spend_count
                 << " missing_source_spends=" << txs_missing_source_count
                 << " outgoing_only_txs=" << txs_outgoing_only_count
                 << " transactions_before_sort=" << resp.transactions.size()
                 << " total_received=" << std::uint64_t(resp.total_received)
                 << " total_sent_from_candidate_spends=" << txs_total_sent
+                << " txpool_overlay_added=" << txs_txpool_overlay_added
+                << " txpool_overlay_amount=" << txs_txpool_overlay_amount
                 << " scan_height=" << resp.scanned_height
                 << " blockchain_height=" << resp.blockchain_height);
         }
@@ -1528,41 +1988,38 @@ namespace lws
         for (const auto& image : confirmed->make_range())
           confirmed_images.insert(image);
 
-        std::vector<std::pair<db::output_id, db::output::spend_meta_>> output_meta{};
-        output_meta.reserve(outputs->count());
-        for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
-        {
-          const db::output::spend_meta_ meta = output.get_value<MONERO_FIELD(db::output, spend_meta)>();
-          output_meta.push_back({meta.id, meta});
-        }
-
-        outputs->reset();
-
-        std::vector<confirmed_spend_choice> confirmed_spend_choices{};
-        confirmed_spend_choices.reserve(confirmed_images.size());
+        std::set<db::output_id, output_id_less> confirmed_sources{};
         for (const auto& spend : spends->make_range())
         {
           if (confirmed_images.count(spend.image) == 0)
             continue;
-
-          const auto* meta = [&output_meta, &spend] () -> const db::output::spend_meta_*
-          {
-            for (const auto& elem : output_meta)
-            {
-              if (elem.first == spend.source)
-                return std::addressof(elem.second);
-            }
-            return nullptr;
-          }();
-          if (!meta)
-            continue;
-
-          select_largest_confirmed_spend_source(confirmed_spend_choices, spend, *meta);
+          confirmed_sources.insert(spend.source);
         }
 
-        std::set<db::output_id, output_id_less> confirmed_sources{};
-        for (const confirmed_spend_choice& choice : confirmed_spend_choices)
-          confirmed_sources.insert(choice.spend.source);
+        auto pending_stream = user->second.get_pending_spends(user->first.id);
+        if (!pending_stream)
+          return pending_stream.error();
+
+        const std::uint64_t now = unix_timestamp_now();
+        std::size_t pending_loaded_count = 0;
+        std::size_t pending_active_count = 0;
+        std::size_t pending_expired_count = 0;
+        std::vector<db::pending_spend> pending_active{};
+        pending_active.reserve(pending_stream->count());
+        for (const auto& pending : pending_stream->make_range())
+        {
+          ++pending_loaded_count;
+          const std::uint64_t recorded = std::uint64_t(pending.recorded);
+          if (recorded <= now && now - recorded <= pending_spend_ttl_seconds)
+          {
+            pending_active.push_back(pending);
+            ++pending_active_count;
+          }
+          else
+          {
+            ++pending_expired_count;
+          }
+        }
 
         std::uint64_t received = 0;
         std::uint64_t candidate_spent_hidden_amount = 0;
@@ -1571,6 +2028,10 @@ namespace lws
         std::size_t dust_or_mixin_skipped_count = 0;
         std::uint64_t confirmed_source_skipped_amount = 0;
         std::size_t confirmed_source_skipped_count = 0;
+        std::uint64_t confirmed_image_skipped_amount = 0;
+        std::size_t confirmed_image_skipped_count = 0;
+        std::uint64_t pending_source_skipped_amount = 0;
+        std::size_t pending_source_skipped_count = 0;
         std::uint64_t clean_returned_amount = 0;
         std::size_t clean_returned_count = 0;
         std::size_t candidate_spent_samples = 0;
@@ -1587,6 +2048,47 @@ namespace lws
             dust_or_mixin_skipped_amount += out.spend_meta.amount;
             continue;
           }
+
+          auto spend_images = get_output_spend_images(user->second, out.spend_meta.id);
+          if (!spend_images)
+            return spend_images.error();
+
+          const bool confirmed_image_match = has_confirmed_spend_image(*spend_images, confirmed_images);
+          if (!spend_images->empty())
+          {
+            ++candidate_spent_hidden_count;
+            if (std::numeric_limits<std::uint64_t>::max() - candidate_spent_hidden_amount < out.spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            candidate_spent_hidden_amount += out.spend_meta.amount;
+            if (confirmed_image_match)
+            {
+              ++confirmed_image_skipped_count;
+              if (std::numeric_limits<std::uint64_t>::max() - confirmed_image_skipped_amount < out.spend_meta.amount)
+                return {lws::error::bad_daemon_response};
+              confirmed_image_skipped_amount += out.spend_meta.amount;
+            }
+            if (debug && candidate_spent_samples < 8)
+            {
+              MINFO("/get_unspent_outs possible-spend skipped sample[" << candidate_spent_samples << "]: tx_hash="
+                    << epee::string_tools::pod_to_hex(out.link.tx_hash)
+                    << " global_index=" << out.spend_meta.id.low
+                    << " amount_bucket=" << out.spend_meta.id.high
+                    << " output_index=" << out.spend_meta.index
+                    << " amount=" << out.spend_meta.amount
+                    << " possible_spend_key_images=" << spend_images->size()
+                    << " confirmed_image_match=" << confirmed_image_match
+                    << " confirmed_sources_match=" << (confirmed_sources.count(out.spend_meta.id) != 0));
+              for (std::size_t image_index = 0; image_index < spend_images->size(); ++image_index)
+              {
+                MINFO("/get_unspent_outs possible-spend image sample[" << candidate_spent_samples << "][" << image_index << "]: key_image="
+                      << epee::string_tools::pod_to_hex((*spend_images)[image_index])
+                      << " confirmed=" << (confirmed_images.count((*spend_images)[image_index]) != 0));
+              }
+              ++candidate_spent_samples;
+            }
+            continue;
+          }
+
           if (confirmed_sources.count(out.spend_meta.id) != 0)
           {
             ++confirmed_source_skipped_count;
@@ -1596,39 +2098,27 @@ namespace lws
             continue;
           }
 
+          const bool locally_pending_spent = std::any_of(
+            pending_active.begin(), pending_active.end(), [&out] (const db::pending_spend& pending)
+            {
+              return pending_spend_matches_output(pending, out);
+            }
+          );
+          if (locally_pending_spent)
+          {
+            ++pending_source_skipped_count;
+            if (std::numeric_limits<std::uint64_t>::max() - pending_source_skipped_amount < out.spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            pending_source_skipped_amount += out.spend_meta.amount;
+            continue;
+          }
+
           received += out.spend_meta.amount;
           unspent.push_back({out, {}});
-
-          auto images = user->second.get_images(out.spend_meta.id);
-          if (!images)
-            return images.error();
-
-          const std::size_t possible_spend_images = images->count();
-          if (possible_spend_images != 0)
-          {
-            ++candidate_spent_hidden_count;
-            if (std::numeric_limits<std::uint64_t>::max() - candidate_spent_hidden_amount < out.spend_meta.amount)
-              return {lws::error::bad_daemon_response};
-            candidate_spent_hidden_amount += out.spend_meta.amount;
-            if (debug && candidate_spent_samples < 8)
-            {
-              MINFO("/get_unspent_outs candidate-spent hidden sample[" << candidate_spent_samples << "]: tx_hash="
-                    << epee::string_tools::pod_to_hex(out.link.tx_hash)
-                    << " global_index=" << out.spend_meta.id.low
-                    << " amount_bucket=" << out.spend_meta.id.high
-                    << " output_index=" << out.spend_meta.index
-                    << " amount=" << out.spend_meta.amount
-                    << " possible_spend_key_images=" << possible_spend_images);
-              ++candidate_spent_samples;
-            }
-          }
-          else
-          {
-            ++clean_returned_count;
-            if (std::numeric_limits<std::uint64_t>::max() - clean_returned_amount < out.spend_meta.amount)
-              return {lws::error::bad_daemon_response};
-            clean_returned_amount += out.spend_meta.amount;
-          }
+          ++clean_returned_count;
+          if (std::numeric_limits<std::uint64_t>::max() - clean_returned_amount < out.spend_meta.amount)
+            return {lws::error::bad_daemon_response};
+          clean_returned_amount += out.spend_meta.amount;
         }
 
         auto additional_tx_pub_keys = fetch_additional_tx_pub_keys(unspent, daemon_client);
@@ -1654,11 +2144,21 @@ namespace lws
         if (debug)
         {
           MINFO("/get_unspent_outs selection summary: outputs=" << outputs->count()
+                << " patch_marker=" << lws_spent_state_patch_marker
+                << " balance_policy=not_applicable"
+                << " unspent_policy=skip_any_possible_spend_image"
                 << " spends=" << spends->count()
                 << " confirmed_spend_images=" << confirmed_images.size()
                 << " confirmed_sources=" << confirmed_sources.size()
+                << " pending_spends_loaded=" << pending_loaded_count
+                << " pending_spends_active=" << pending_active_count
+                << " pending_spends_expired=" << pending_expired_count
+                << " pending_source_skipped_count=" << pending_source_skipped_count
+                << " pending_source_skipped_amount=" << pending_source_skipped_amount
                 << " confirmed_source_skipped_count=" << confirmed_source_skipped_count
                 << " confirmed_source_skipped_amount=" << confirmed_source_skipped_amount
+                << " confirmed_image_skipped_count=" << confirmed_image_skipped_count
+                << " confirmed_image_skipped_amount=" << confirmed_image_skipped_amount
                 << " dust_or_mixin_skipped_count=" << dust_or_mixin_skipped_count
                 << " dust_or_mixin_skipped_amount=" << dust_or_mixin_skipped_amount
                 << " returned_outputs=" << response_outputs.size()
@@ -2012,6 +2512,7 @@ namespace lws
         {
           crypto::key_image key_image;
           boost::optional<rpc::safe_uint64> output_index;
+          bool has_exact_source;
           boost::optional<db::output_id> known_source;
           bool before_spent;
         };
@@ -2054,6 +2555,7 @@ namespace lws
             debug_rows.push_back(import_key_image_debug{
               key_image.key_image,
               key_image.output_index,
+              bool(key_image.amount && key_image.global_index && key_image.tx_hash && key_image.public_key && key_image.output_index),
               known_source,
               confirmed_before.count(key_image.key_image) != 0
             });
@@ -2062,19 +2564,36 @@ namespace lws
 
         std::vector<crypto::key_image> key_images{};
         key_images.reserve(req.key_images.size());
+        std::vector<db::key_image_source> key_image_sources{};
+        key_image_sources.reserve(req.key_images.size());
         for (const auto& key_image : req.key_images)
+        {
           key_images.push_back(key_image.key_image);
+
+          if (key_image.amount && key_image.global_index && key_image.tx_hash && key_image.public_key && key_image.output_index)
+          {
+            db::key_image_source source{};
+            source.image = key_image.key_image;
+            source.source = db::output_id{std::uint64_t(*key_image.amount), std::uint64_t(*key_image.global_index)};
+            source.tx_hash = *key_image.tx_hash;
+            source.pub = *key_image.public_key;
+            source.out_index = std::uint32_t(std::uint64_t(*key_image.output_index));
+            key_image_sources.push_back(source);
+          }
+        }
 
         user->second.finish_read();
 
         MINFO("/import_key_images before_write: account_id=" << unsigned(account.id)
               << " key_images=" << key_images.size()
+              << " exact_sources=" << key_image_sources.size()
               << " initial_reader_active=0");
-        auto result = data.global->disk.clone().import_key_images(account.id, epee::to_span(key_images));
+        auto result = data.global->disk.clone().import_key_images(account.id, epee::to_span(key_images), epee::to_span(key_image_sources));
         if (!result)
         {
           MERROR("/import_key_images write_failed: account_id=" << unsigned(account.id)
                  << " key_images=" << key_images.size()
+                 << " exact_sources=" << key_image_sources.size()
                  << " error=" << result.error().message()
                  << " initial_reader_active=0");
           return result.error();
@@ -2083,7 +2602,19 @@ namespace lws
               << " imported=" << std::uint64_t(result->imported)
               << " confirmed_spends=" << std::uint64_t(result->confirmed_spends)
               << " unconfirmed=" << std::uint64_t(result->unconfirmed)
+              << " unique_inputs=" << result->unique_inputs
+              << " known_spend_inputs=" << result->known_spend_inputs
+              << " already_confirmed=" << result->already_confirmed
+              << " exact_source_candidates=" << result->exact_source_candidates
+              << " exact_source_known_spend=" << result->exact_source_known_spend
+              << " exact_source_unknown_spend=" << result->exact_source_unknown_spend
+              << " exact_source_matched_output=" << result->exact_source_matched_output
+              << " exact_source_missing_output=" << result->exact_source_missing_output
+              << " exact_source_inserted=" << result->exact_source_inserted
+              << " exact_source_already_present=" << result->exact_source_already_present
               << " initial_reader_active=0");
+
+        maybe_auto_rescan_after_key_images(*data.global, account, *result);
 
         if (data.global->options.debug)
         {
@@ -2114,6 +2645,7 @@ namespace lws
             MINFO("/import_key_images key_image[" << index << "]: key_image="
                   << epee::string_tools::pod_to_hex(row.key_image)
                   << " output_index=" << (row.output_index ? std::to_string(std::uint64_t(*row.output_index)) : std::string{"null"})
+                  << " has_exact_source=" << row.has_exact_source
                   << " known_spend=" << bool(row.known_source)
                   << " known_source_global_index=" << (row.known_source ? std::to_string(row.known_source->low) : std::string{"null"})
                   << " known_source_amount_bucket=" << (row.known_source ? std::to_string(row.known_source->high) : std::string{"null"})
@@ -2125,7 +2657,14 @@ namespace lws
                 << " unique_confirmed_after=" << confirmed_after.size()
                 << " imported=" << std::uint64_t(result->imported)
                 << " confirmed_spends=" << std::uint64_t(result->confirmed_spends)
-                << " unconfirmed=" << std::uint64_t(result->unconfirmed));
+                << " unconfirmed=" << std::uint64_t(result->unconfirmed)
+                << " exact_source_candidates=" << result->exact_source_candidates
+                << " exact_source_known_spend=" << result->exact_source_known_spend
+                << " exact_source_unknown_spend=" << result->exact_source_unknown_spend
+                << " exact_source_matched_output=" << result->exact_source_matched_output
+                << " exact_source_missing_output=" << result->exact_source_missing_output
+                << " exact_source_inserted=" << result->exact_source_inserted
+                << " exact_source_already_present=" << result->exact_source_already_present);
         }
 
         return response{
@@ -2438,12 +2977,27 @@ namespace lws
 
         struct frame
         {
+          struct submit_context
+          {
+            epee::byte_slice message;
+            std::function<async_complete> resume;
+            db::account_id pending_account;
+            std::vector<db::pending_spend> pending_spends;
+
+            submit_context(epee::byte_slice message, std::function<async_complete>&& resume, db::account_id pending_account, std::vector<db::pending_spend>&& pending_spends)
+              : message(std::move(message)),
+                resume(std::move(resume)),
+                pending_account(pending_account),
+                pending_spends(std::move(pending_spends))
+            {}
+          };
+
           rest_server_data* parent;
           std::string in;
           net::zmq::async_client client;
           boost::asio::steady_timer timer;
           boost::asio::io_context::strand strand;
-          std::deque<std::pair<epee::byte_slice, std::function<async_complete>>> resumers;
+          std::deque<submit_context> resumers;
 
           frame(rest_server_data& parent, net::zmq::async_client client)
             : parent(std::addressof(parent)),
@@ -2469,6 +3023,31 @@ namespace lws
         daemon_req.relay = true;
         daemon_req.tx_as_hex = std::move(req.tx);
 
+        db::account_id pending_account = db::account_id::invalid;
+        std::vector<db::pending_spend> pending_spends{};
+        if (!req.pending_spent_outputs.empty())
+        {
+          if (!req.creds)
+            return {lws::error::bad_client_tx};
+          auto user = open_account(*req.creds, data.global->disk.clone());
+          if (!user)
+            return user.error();
+
+          const db::account_time recorded{std::uint32_t(std::min<std::uint64_t>(unix_timestamp_now(), std::numeric_limits<std::uint32_t>::max()))};
+          pending_account = user->first.id;
+          pending_spends.reserve(req.pending_spent_outputs.size());
+          for (const auto& pending : req.pending_spent_outputs)
+          {
+            pending_spends.push_back(db::pending_spend{
+              db::output_id{std::uint64_t(pending.amount), std::uint64_t(pending.global_index)},
+              pending.tx_hash,
+              pending.public_key,
+              pending.out_index,
+              recorded
+            });
+          }
+        }
+
         if (data.global->options.debug)
         {
           const auto& tx_hex = daemon_req.tx_as_hex;
@@ -2489,7 +3068,7 @@ namespace lws
         auto active = cache.status.lock();
         if (active)
         {
-          active->resumers.emplace_back(std::move(msg), std::move(resume));
+          active->resumers.emplace_back(std::move(msg), std::move(resume), pending_account, std::move(pending_spends));
           return success();
         }
 
@@ -2506,7 +3085,7 @@ namespace lws
             assert(self_ != nullptr);
             assert(self_->strand.running_in_this_thread());
 
-            std::deque<std::pair<epee::byte_slice, std::function<async_complete>>> resumers;
+            std::deque<frame::submit_context> resumers;
             {
               const boost::lock_guard<boost::mutex> lock{cache.sync};
               if (error)
@@ -2527,7 +3106,7 @@ namespace lws
             }
 
             for (const auto& r : resumers)
-              r.second(value);
+              r.resume(value);
           }
 
           bool set_timeout(std::chrono::steady_clock::duration timeout, const bool expecting) const
@@ -2578,7 +3157,7 @@ namespace lws
                     self_->parent->store_async_client(std::move(self_->client));
                     return;
                   }
-                  next = std::move(self_->resumers.front().first);
+                  next = std::move(self_->resumers.front().message);
                 }
 
                 set_timeout(std::chrono::seconds{10}, false);
@@ -2638,6 +3217,22 @@ namespace lws
                   }
                   else
                   {
+                    const auto& current = self.resumers.front();
+                    if (!current.pending_spends.empty())
+                    {
+                      const auto stored = self.parent->disk.clone().record_pending_spends(
+                        current.pending_account, epee::to_span(current.pending_spends)
+                      );
+                      if (!stored)
+                      {
+                        MWARNING("/submit_raw_tx pending_spends persist failed after relay success: " << stored.error().message());
+                      }
+                      else if (self.parent->options.debug)
+                      {
+                        MINFO("/submit_raw_tx pending_spends persisted: account_id=" << unsigned(current.pending_account)
+                              << " count=" << current.pending_spends.size());
+                      }
+                    }
                     if (self.parent->options.debug)
                       MINFO("/submit_raw_tx BRANCH[success]: relayed=true");
                     send_response({}, json_response(async_response{"OK"}));
@@ -2655,7 +3250,7 @@ namespace lws
         active = std::make_shared<frame>(*data.global, std::move(*client));
         cache.status = active;
 
-        active->resumers.emplace_back(std::move(msg), std::move(resume));
+        active->resumers.emplace_back(std::move(msg), std::move(resume), pending_account, std::move(pending_spends));
         lock.unlock();
 
         MDEBUG("Starting new ZMQ request in /submit_raw_tx");
@@ -3292,7 +3887,7 @@ namespace lws
   }
 
   rest_server::rest_server(epee::span<const std::string> addresses, std::vector<std::string> admin, db::storage disk, rpc::client client, configuration config)
-    : global_(std::make_unique<rest_server_data>(std::move(disk), std::move(client), runtime_options{config.max_subaddresses, config.webhook_verify, config.disable_admin_auth, config.auto_accept_creation, config.auto_accept_import, config.debug})),
+    : global_(std::make_unique<rest_server_data>(std::move(disk), std::move(client), runtime_options{config.max_subaddresses, config.webhook_verify, config.disable_admin_auth, config.auto_accept_creation, config.auto_accept_import, config.debug, config.auto_rescan_after_key_images, config.auto_rescan_depth, config.auto_rescan_min_confirmed_spends})),
       ports_(),
       workers_()
   {

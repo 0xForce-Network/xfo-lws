@@ -93,6 +93,9 @@ namespace
     const command_line::arg_descriptor<double> split_sync_threads;
     const command_line::arg_descriptor<std::uint64_t> split_sync_depth;
     const command_line::arg_descriptor<bool> balance_new_addresses;
+    const command_line::arg_descriptor<bool> auto_rescan_after_key_images;
+    const command_line::arg_descriptor<std::uint64_t> auto_rescan_depth;
+    const command_line::arg_descriptor<std::uint64_t> auto_rescan_min_confirmed_spends;
 
     static std::string get_default_zmq()
     {
@@ -149,6 +152,9 @@ namespace
       , split_sync_threads{"split-sync-threads", "Percentage of threads to use for fully synced accounts (0-1, requires --block-depth-threading, 0 to disable)", 0.0}
       , split_sync_depth{"split-sync-depth", "Maximum block depth for an address to be considered synced (defaults to 10)", 10}
       , balance_new_addresses{"balance-new-addresses", "Assign new addresses to thread with highest blockheight (or fewest addresses if tied)", false}
+      , auto_rescan_after_key_images{"auto-rescan-after-key-images", "After /import_key_images confirms spends, automatically rewind that account for a bounded rescan", false}
+      , auto_rescan_depth{"auto-rescan-depth", "Block depth for --auto-rescan-after-key-images; 0 rewinds to account start_height", 720}
+      , auto_rescan_min_confirmed_spends{"auto-rescan-min-confirmed-spends", "Minimum confirmed spends in an /import_key_images call before auto rescan is triggered", 1}
     {}
 
     void prepare(boost::program_options::options_description& description) const
@@ -193,6 +199,9 @@ namespace
       command_line::add_arg(description, split_sync_threads);
       command_line::add_arg(description, split_sync_depth);
       command_line::add_arg(description, balance_new_addresses);
+      command_line::add_arg(description, auto_rescan_after_key_images);
+      command_line::add_arg(description, auto_rescan_depth);
+      command_line::add_arg(description, auto_rescan_min_confirmed_spends);
     }
   };
 
@@ -303,7 +312,10 @@ namespace
         command_line::get_arg(args, opts.disable_admin_auth),
         command_line::get_arg(args, opts.auto_accept_creation),
         command_line::get_arg(args, opts.auto_accept_import),
-        debug_enabled
+        debug_enabled,
+        command_line::get_arg(args, opts.auto_rescan_after_key_images),
+        command_line::get_arg(args, opts.auto_rescan_depth),
+        command_line::get_arg(args, opts.auto_rescan_min_confirmed_spends)
       },
       command_line::get_arg(args, opts.daemon_rpc),
       command_line::get_arg(args, opts.daemon_sub),
@@ -371,6 +383,9 @@ namespace
       MINFO("Using monerod ZMQ sub at " << sub_address);
     if (prog.rest_config.debug)
       MINFO("LWS debug diagnostics enabled via --debug");
+    if (prog.rest_config.auto_rescan_after_key_images)
+      MINFO("LWS auto rescan after key images enabled: depth=" << prog.rest_config.auto_rescan_depth
+            << " min_confirmed_spends=" << prog.rest_config.auto_rescan_min_confirmed_spends);
 
     auto client = scanner.sync(ctx.connect().value(), prog.untrusted_daemon).value();
 

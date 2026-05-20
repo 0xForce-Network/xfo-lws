@@ -331,6 +331,29 @@ namespace db
   };
   WIRE_DECLARE_OBJECT(key_image);
 
+  //! Exact source output identity supplied by the wallet for an imported key image.
+  struct key_image_source
+  {
+    crypto::key_image image;   //!< Confirmed key image imported by the wallet.
+    output_id source;          //!< Exact source output id resolved from wallet identity.
+    crypto::hash tx_hash;      //!< Source transaction hash for output identity validation.
+    crypto::public_key pub;    //!< One-time public key for output identity validation.
+    std::uint32_t out_index;   //!< Output index within the source transaction.
+    char reserved[4];
+  };
+  static_assert(sizeof(key_image_source) == 32 + 16 + 32 + 32 + 4 + 4, "padding in key_image_source");
+
+  //! Locally submitted spend marker, persisted after successful /submit_raw_tx relay.
+  struct pending_spend
+  {
+    output_id source;          //!< The output being spent: {amount bucket, global index}.
+    crypto::hash tx_hash;      //!< Source transaction hash for output identity.
+    crypto::public_key pub;    //!< One-time public key for output identity.
+    std::uint32_t out_index;   //!< Output index within the source transaction.
+    account_time recorded;     //!< UNIX timestamp when LWS accepted the marker.
+  };
+  static_assert(sizeof(pending_spend) == 16 + 32 + 32 + 4 + 4, "padding in pending_spend");
+
   struct request_info
   {
     account_address address;//!< Must be first for LMDB optimizations

@@ -41,6 +41,7 @@
 #include "time_helper.h"       // monero/contrib/epee/include
 #include "ringct/rctOps.h"     // monero/src
 #include "span.h"              // monero/contrib/epee/include
+#include "string_tools.h"      // monero/contrib/epee/include
 #include "util/random_outputs.h"
 #include "version.h"           // monero/src
 #include "wire.h"
@@ -56,7 +57,8 @@
 namespace
 {
   using max_subaddrs = wire::max_element_count<16384>;
-  using max_key_images = wire::max_element_count<4096>;
+  using max_key_images = wire::max_element_count<1024>;
+  using max_pending_spent_outputs = wire::max_element_count<256>;
 
   enum class iso_timestamp : std::uint64_t {};
 
@@ -294,6 +296,7 @@ namespace lws
       }
 
       const bool is_coinbase = (extra.first & db::coinbase_output);
+      const bool is_mempool = self.value().info.link.height == db::block_id::txpool;
 
       wire::object(dest,
         wire::field("id", std::uint64_t(self.index())),
@@ -306,7 +309,7 @@ namespace lws
         wire::field("height", self.value().info.link.height),
         wire::optional_field("payment_id", payment_id),
         wire::field("coinbase", is_coinbase),
-        wire::field("mempool", false),
+        wire::field("mempool", is_mempool),
         wire::field("mixin", self.value().info.spend_meta.mixin_count),
         wire::field("recipient", self.value().info.recipient),
         wire::field("spent_outputs", std::cref(self.value().spends))
@@ -428,7 +431,11 @@ namespace lws
   {
     wire::object(source,
       wire::field("key_image", std::ref(self.key_image)),
-      WIRE_OPTIONAL_FIELD(output_index)
+      WIRE_OPTIONAL_FIELD(output_index),
+      WIRE_OPTIONAL_FIELD(amount),
+      WIRE_OPTIONAL_FIELD(global_index),
+      WIRE_OPTIONAL_FIELD(tx_hash),
+      WIRE_OPTIONAL_FIELD(public_key)
     );
   }
 
@@ -490,7 +497,37 @@ namespace lws
 
   void rpc::read_bytes(wire::json_reader& source, submit_raw_tx_request& self)
   {
-    wire::object(source, WIRE_FIELD(tx));
+    boost::optional<std::string> address;
+    boost::optional<std::string> view_key;
+    wire::object(source,
+      WIRE_FIELD(tx),
+      wire::optional_field("address", std::ref(address)),
+      wire::optional_field("view_key", std::ref(view_key)),
+      WIRE_FIELD_ARRAY(pending_spent_outputs, max_pending_spent_outputs)
+    );
+
+    if (!self.pending_spent_outputs.empty())
+    {
+      if (!address || !view_key)
+        WIRE_DLOG_THROW(wire::error::schema::missing_key, "pending_spent_outputs requires address and view_key");
+
+      account_credentials creds{};
+      convert_address(*address, creds.address);
+      if (!epee::string_tools::hex_to_pod(*view_key, unwrap(unwrap(creds.key))))
+        WIRE_DLOG_THROW(wire::error::schema::fixed_binary, "view_key must be 32-byte hex");
+      self.creds = creds;
+    }
+  }
+
+  void rpc::read_bytes(wire::json_reader& source, submit_raw_tx_request::pending_spent_output& self)
+  {
+    wire::object(source,
+      WIRE_FIELD(amount),
+      WIRE_FIELD(global_index),
+      WIRE_FIELD(out_index),
+      WIRE_FIELD(tx_hash),
+      WIRE_FIELD(public_key)
+    );
   }
   void rpc::write_bytes(wire::json_writer& dest, const submit_raw_tx_response self)
   {

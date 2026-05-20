@@ -291,6 +291,10 @@ namespace rpc
   {
     crypto::key_image key_image;
     boost::optional<safe_uint64> output_index;
+    boost::optional<safe_uint64> amount;
+    boost::optional<safe_uint64> global_index;
+    boost::optional<crypto::hash> tx_hash;
+    boost::optional<crypto::public_key> public_key;
   };
   void read_bytes(wire::json_reader&, import_key_image&);
 
@@ -348,8 +352,21 @@ namespace rpc
   struct submit_raw_tx_request
   {
     submit_raw_tx_request() = delete;
+    struct pending_spent_output
+    {
+      pending_spent_output() noexcept = default;
+      safe_uint64 amount;
+      safe_uint64 global_index;
+      std::uint32_t out_index;
+      crypto::hash tx_hash;
+      crypto::public_key public_key;
+    };
+
     std::string tx;
+    boost::optional<account_credentials> creds;
+    std::vector<pending_spent_output> pending_spent_outputs;
   };
+  void read_bytes(wire::json_reader&, submit_raw_tx_request::pending_spent_output&);
   void read_bytes(wire::json_reader&, submit_raw_tx_request&);
 
   struct submit_raw_tx_response

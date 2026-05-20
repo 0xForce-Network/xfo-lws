@@ -66,6 +66,7 @@
 #include "rpc/scanner/queue.h"
 #include "rpc/scanner/server.h"
 #include "rpc/webhook.h"
+#include "string_tools.h"          // monero/contrib/epee/include
 #include "util/blocks.h"
 #include "util/source_location.h"
 #include "util/transactions.h"
@@ -551,6 +552,17 @@ namespace lws
               lws::decrypt_payment_id(payment_id.second.short_, active_derived);
             }
           }
+          if (height == db::block_id::txpool)
+          {
+            MINFO("lws-txpool-diagnostic: incoming output matched account_id=" << unsigned(user.id())
+                  << " address=" << user.address()
+                  << " amount_atomic=" << amount
+                  << " output_index=" << index
+                  << " tx_prefix_hash=" << epee::string_tools::pod_to_hex(*prefix_hash)
+                  << " output_global_index=" << out_ids.at(index)
+                  << " unlock_time=" << tx.unlock_time
+                  << " action=output_action_only_no_db_output_insert");
+          }
           const bool added = output_action(
             reader.reader,
             user,
@@ -607,6 +619,10 @@ namespace lws
         MERROR("Failed parsing txpool pub: " << parsed.error().message());
         return;
       }
+
+      MINFO("lws-txpool-diagnostic: received full_txpool pub tx_count=" << parsed->txes.size()
+            << " account_count=" << users.size()
+            << " action=scan_without_db_persist");
 
       const auto time =
         boost::numeric_cast<std::uint64_t>(std::chrono::system_clock::to_time_t(std::chrono::system_clock::now()));
@@ -822,6 +838,21 @@ namespace lws
 
               // process txpool first
               auto message = new_pubs->begin();
+              {
+                std::size_t txpool_pub_count = 0;
+                std::size_t block_pub_count = 0;
+                for (const auto& pub : *new_pubs)
+                {
+                  if (pub.first == rpc::client::topic::txpool)
+                    ++txpool_pub_count;
+                  else if (pub.first == rpc::client::topic::block)
+                    ++block_pub_count;
+                }
+                MINFO("lws-txpool-diagnostic: wait_for_block messages total=" << new_pubs->size()
+                      << " txpool=" << txpool_pub_count
+                      << " block=" << block_pub_count
+                      << " disk_enabled=" << bool(disk));
+              }
               for ( ; message != new_pubs->end(); ++message)
               {
                 if (!disk || message->first != rpc::client::topic::txpool)

@@ -68,6 +68,9 @@ namespace lws
       bool auto_accept_creation;
       bool auto_accept_import;
       bool debug;
+      bool auto_rescan_after_key_images;
+      std::uint64_t auto_rescan_depth;
+      std::uint64_t auto_rescan_min_confirmed_spends;
     };
 
     explicit rest_server(epee::span<const std::string> addresses, std::vector<std::string> admin, db::storage disk, rpc::client client, configuration config);

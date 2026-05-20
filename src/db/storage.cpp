@@ -36,6 +36,7 @@
 #include <cassert>
 #include <chrono>
 #include <limits>
+#include <map>
 #include <set>
 #include <string>
 #include <utility>
@@ -60,6 +61,7 @@
 #include "lmdb/value_stream.h"
 #include "net/net_parse_helpers.h" // monero/contrib/epee/include
 #include "span.h"
+#include "string_tools.h" // monero/contrib/epee/include
 #include "wire/adapted/array.h"
 #include "wire/filters.h"
 #include "wire/json.h"
@@ -337,6 +339,67 @@ namespace db
       return less<output_id>(left_bytes, right_bytes);
     }
 
+    int pending_spend_compare(MDB_val const* left, MDB_val const* right) noexcept
+    {
+      if (left == nullptr || right == nullptr)
+      {
+        assert("MDB_val nullptr" == 0);
+        return -1;
+      }
+
+      auto left_bytes = lmdb::to_byte_span(*left);
+      auto right_bytes = lmdb::to_byte_span(*right);
+
+      int diff = less<output_id>(left_bytes, right_bytes);
+      if (diff)
+        return diff;
+
+      left_bytes.remove_prefix(sizeof(output_id));
+      right_bytes.remove_prefix(sizeof(output_id));
+
+      diff = compare_32bytes(left_bytes, right_bytes);
+      if (diff)
+        return diff;
+
+      left_bytes.remove_prefix(sizeof(crypto::hash));
+      right_bytes.remove_prefix(sizeof(crypto::hash));
+
+      diff = compare_32bytes(left_bytes, right_bytes);
+      if (diff)
+        return diff;
+
+      left_bytes.remove_prefix(sizeof(crypto::public_key));
+      right_bytes.remove_prefix(sizeof(crypto::public_key));
+
+      diff = less<std::uint32_t>(left_bytes, right_bytes);
+      if (diff)
+        return diff;
+
+      left_bytes.remove_prefix(sizeof(std::uint32_t));
+      right_bytes.remove_prefix(sizeof(std::uint32_t));
+      return less<lmdb::native_type<account_time>>(left_bytes, right_bytes);
+    }
+
+    int key_image_source_compare(MDB_val const* left, MDB_val const* right) noexcept
+    {
+      if (left == nullptr || right == nullptr)
+      {
+        assert("MDB_val nullptr" == 0);
+        return -1;
+      }
+
+      auto left_bytes = lmdb::to_byte_span(*left);
+      auto right_bytes = lmdb::to_byte_span(*right);
+
+      int diff = compare_32bytes(left_bytes, right_bytes);
+      if (diff)
+        return diff;
+
+      left_bytes.remove_prefix(sizeof(crypto::key_image));
+      right_bytes.remove_prefix(sizeof(crypto::key_image));
+      return less<output_id>(left_bytes, right_bytes);
+    }
+
     constexpr const lmdb::basic_table<unsigned, block_info> blocks{
       "blocks_by_id", (MDB_CREATE | MDB_DUPSORT), MONERO_SORT_BY(block_info, id)
     };
@@ -375,6 +438,12 @@ namespace db
     };
     constexpr const lmdb::basic_table<account_id, crypto::key_image> confirmed_spends{
       "confirmed_spend_images_by_account_id,key_image", (MDB_CREATE | MDB_DUPSORT), &compare_32bytes_val
+    };
+    constexpr const lws_lmdb::basic_table<account_id, key_image_source> imported_spend_sources{
+      "imported_spend_sources_by_account_id,key_image,output_id", (MDB_CREATE | MDB_DUPSORT), &key_image_source_compare
+    };
+    constexpr const lws_lmdb::basic_table<account_id, pending_spend> pending_spends{
+      "pending_spends_by_account_id,output_identity", (MDB_CREATE | MDB_DUPSORT), &pending_spend_compare
     };
     constexpr const lmdb::basic_table<request, v0::request_info> requests_v0{
       "requests_by_type,address", MDB_DUPSORT, MONERO_COMPARE(v0::request_info, address.spend_public)
@@ -777,6 +846,8 @@ namespace db
       MDB_dbi spends;
       MDB_dbi images;
       MDB_dbi confirmed_spends;
+      MDB_dbi imported_spend_sources;
+      MDB_dbi pending_spends;
       MDB_dbi requests;
       MDB_dbi webhooks;
       MDB_dbi events;
@@ -801,6 +872,8 @@ namespace db
       tables.spends      = spends.open(*txn).value();
       tables.images      = images.open(*txn).value();
       tables.confirmed_spends = confirmed_spends.open(*txn).value();
+      tables.imported_spend_sources = imported_spend_sources.open(*txn).value();
+      tables.pending_spends = pending_spends.open(*txn).value();
       tables.requests    = requests.open(*txn).value();
       tables.webhooks    = webhooks.open(*txn).value();
       tables.events      = events_by_account_id.open(*txn).value();
@@ -1152,6 +1225,24 @@ namespace db
     assert(db != nullptr);
     MONERO_CHECK(check_cursor(*txn, db->tables.confirmed_spends, cur));
     return confirmed_spends.get_value_stream(id, std::move(cur));
+  }
+
+  expect<lws_lmdb::value_stream<key_image_source, cursor::close_imported_spend_sources>>
+  storage_reader::get_imported_spend_sources(account_id id, cursor::imported_spend_sources cur) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+    MONERO_CHECK(check_cursor(*txn, db->tables.imported_spend_sources, cur));
+    return imported_spend_sources.get_value_stream(id, std::move(cur));
+  }
+
+  expect<lws_lmdb::value_stream<pending_spend, cursor::close_pending_spends>>
+  storage_reader::get_pending_spends(account_id id, cursor::pending_spends cur) noexcept
+  {
+    MONERO_PRECOND(txn != nullptr);
+    assert(db != nullptr);
+    MONERO_CHECK(check_cursor(*txn, db->tables.pending_spends, cur));
+    return pending_spends.get_value_stream(id, std::move(cur));
   }
 
   expect<lmdb::key_stream<request, request_info, cursor::close_requests>>
@@ -1564,7 +1655,7 @@ namespace db
   {
     return {
       std::make_shared<storage_internal>(
-        MONERO_UNWRAP(lws_lmdb::open_environment(path, 20)), create_queue_max
+        MONERO_UNWRAP(lws_lmdb::open_environment(path, 24)), create_queue_max
       )
     };
   }
@@ -3420,10 +3511,10 @@ namespace db
   }
 
   expect<storage::import_key_images_result>
-  storage::import_key_images(const account_id id, const epee::span<const crypto::key_image> images)
+  storage::import_key_images(const account_id id, const epee::span<const crypto::key_image> images, const epee::span<const key_image_source> sources)
   {
     MONERO_PRECOND(db != nullptr);
-    return db->try_write([this, id, images] (MDB_txn& txn) -> expect<import_key_images_result>
+    return db->try_write([this, id, images, sources] (MDB_txn& txn) -> expect<import_key_images_result>
     {
       struct key_image_less
       {
@@ -3435,8 +3526,12 @@ namespace db
 
       cursor::spends spends_cur;
       cursor::confirmed_spends confirmed_cur;
+      cursor::imported_spend_sources imported_sources_cur;
+      cursor::outputs outputs_cur;
       MONERO_CHECK(check_cursor(txn, this->db->tables.spends, spends_cur));
       MONERO_CHECK(check_cursor(txn, this->db->tables.confirmed_spends, confirmed_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.imported_spend_sources, imported_sources_cur));
+      MONERO_CHECK(check_cursor(txn, this->db->tables.outputs, outputs_cur));
 
       std::set<crypto::key_image, key_image_less> known_spends{};
       {
@@ -3464,6 +3559,7 @@ namespace db
       unique_input.insert(images.begin(), images.end());
 
       import_key_images_result out{};
+      out.unique_inputs = unique_input.size();
       for (const auto& image : unique_input)
       {
         if (known_spends.count(image) == 0)
@@ -3472,6 +3568,7 @@ namespace db
           continue;
         }
 
+        ++out.known_spend_inputs;
         ++out.confirmed_spends;
 
         MDB_val key = lmdb::to_val(id);
@@ -3481,9 +3578,162 @@ namespace db
           ++out.imported;
         else if (err != MDB_KEYEXIST)
           return log_lmdb_error(err, __LINE__, __FILE__);
+        else
+          ++out.already_confirmed;
+      }
+
+      if (!sources.empty())
+      {
+        std::vector<output> output_rows{};
+        {
+          MDB_val key = lmdb::to_val(id);
+          MDB_val value{};
+          int err = mdb_cursor_get(outputs_cur.get(), &key, &value, MDB_SET_KEY);
+          for (;;)
+          {
+            if (err)
+            {
+              if (err == MDB_NOTFOUND)
+                break;
+              return log_lmdb_error(err, __LINE__, __FILE__);
+            }
+
+            const auto out_row = outputs.get_value<output>(value);
+            if (!out_row)
+              return out_row.error();
+            output_rows.push_back(*out_row);
+            err = mdb_cursor_get(outputs_cur.get(), &key, &value, MDB_NEXT_DUP);
+          }
+        }
+
+        struct source_match_summary
+        {
+          std::uint64_t candidates;
+          std::uint64_t known_spend_candidates;
+          std::uint64_t unknown_spend_candidates;
+          std::uint64_t matched_outputs;
+          std::uint64_t missing_outputs;
+          std::uint64_t inserted;
+          std::uint64_t already_present;
+        };
+
+        std::map<crypto::key_image, source_match_summary, key_image_less> source_summaries{};
+        std::size_t source_sample_count = 0;
+        constexpr std::size_t source_sample_limit = 24;
+        MDB_val key = lmdb::to_val(id);
+        for (const auto& imported : sources)
+        {
+          ++out.exact_source_candidates;
+          source_match_summary& summary = source_summaries[imported.image];
+          ++summary.candidates;
+
+          if (known_spends.count(imported.image) == 0)
+          {
+            ++out.exact_source_unknown_spend;
+            ++summary.unknown_spend_candidates;
+            continue;
+          }
+
+          ++out.exact_source_known_spend;
+          ++summary.known_spend_candidates;
+
+          bool matched = false;
+          for (const auto& out_row : output_rows)
+          {
+            if (out_row.spend_meta.id.low != imported.source.low ||
+                out_row.spend_meta.amount != imported.source.high ||
+                out_row.spend_meta.index != imported.out_index ||
+                std::memcmp(std::addressof(out_row.link.tx_hash), std::addressof(imported.tx_hash), sizeof(crypto::hash)) != 0 ||
+                std::memcmp(std::addressof(out_row.pub), std::addressof(imported.pub), sizeof(crypto::public_key)) != 0)
+              continue;
+
+            matched = true;
+            ++out.exact_source_matched_output;
+            ++summary.matched_outputs;
+            key_image_source resolved = imported;
+            resolved.source = out_row.spend_meta.id;
+            MDB_val value = lmdb::to_val(resolved);
+            const int err = mdb_cursor_put(imported_sources_cur.get(), &key, &value, MDB_NODUPDATA);
+            if (err && err != MDB_KEYEXIST)
+              return log_lmdb_error(err, __LINE__, __FILE__);
+            if (!err)
+            {
+              ++out.exact_source_inserted;
+              ++summary.inserted;
+            }
+            else
+            {
+              ++out.exact_source_already_present;
+              ++summary.already_present;
+            }
+            break;
+          }
+          if (!matched)
+          {
+            ++out.exact_source_missing_output;
+            ++summary.missing_outputs;
+          }
+        }
+
+        MINFO("storage::import_key_images exact_source_summary: account_id=" << unsigned(id)
+              << " outputs=" << output_rows.size()
+              << " unique_inputs=" << out.unique_inputs
+              << " known_spend_inputs=" << out.known_spend_inputs
+              << " unconfirmed_inputs=" << out.unconfirmed
+              << " exact_source_candidates=" << out.exact_source_candidates
+              << " exact_source_known_spend=" << out.exact_source_known_spend
+              << " exact_source_unknown_spend=" << out.exact_source_unknown_spend
+              << " exact_source_matched_output=" << out.exact_source_matched_output
+              << " exact_source_missing_output=" << out.exact_source_missing_output
+              << " exact_source_inserted=" << out.exact_source_inserted
+              << " exact_source_already_present=" << out.exact_source_already_present);
+
+        for (const auto& item : source_summaries)
+        {
+          if (source_sample_count >= source_sample_limit)
+            break;
+          const source_match_summary& summary = item.second;
+          if (summary.missing_outputs == 0 && summary.unknown_spend_candidates == 0 && summary.matched_outputs != 0)
+            continue;
+
+          MINFO("storage::import_key_images exact_source_sample[" << source_sample_count << "]: account_id=" << unsigned(id)
+                << " key_image=" << epee::string_tools::pod_to_hex(item.first)
+                << " candidates=" << summary.candidates
+                << " known_spend_candidates=" << summary.known_spend_candidates
+                << " unknown_spend_candidates=" << summary.unknown_spend_candidates
+                << " matched_outputs=" << summary.matched_outputs
+                << " missing_outputs=" << summary.missing_outputs
+                << " inserted=" << summary.inserted
+                << " already_present=" << summary.already_present);
+          ++source_sample_count;
+        }
       }
 
       return out;
+    });
+  }
+
+  expect<void>
+  storage::record_pending_spends(const account_id id, const epee::span<const pending_spend> spends)
+  {
+    MONERO_PRECOND(db != nullptr);
+    if (spends.empty())
+      return success();
+
+    return db->try_write([this, id, spends] (MDB_txn& txn) -> expect<void>
+    {
+      cursor::pending_spends pending_cur;
+      MONERO_CHECK(check_cursor(txn, this->db->tables.pending_spends, pending_cur));
+
+      MDB_val key = lmdb::to_val(id);
+      for (const auto& spend : spends)
+      {
+        MDB_val value = lmdb::to_val(spend);
+        const int err = mdb_cursor_put(pending_cur.get(), &key, &value, MDB_NODUPDATA);
+        if (err && err != MDB_KEYEXIST)
+          return log_lmdb_error(err, __LINE__, __FILE__);
+      }
+      return success();
     });
   }
 

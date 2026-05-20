@@ -468,9 +468,10 @@ namespace rpc
         case 'f': // json-full-txpool_add
           if (boost::string_ref{*pub}.starts_with(full_txpool_topic))
           {
-            pub->erase(0, sizeof(full_txpool_topic));
-            messages.emplace_back(topic::txpool, std::move(*pub));
-          }
+              pub->erase(0, sizeof(full_txpool_topic));
+              MINFO("lws-txpool-diagnostic: received pubsub topic=json-full-txpool_add payload_bytes=" << pub->size());
+              messages.emplace_back(topic::txpool, std::move(*pub));
+            }
           else
             MWARNING("Unexpected pub/sub message");
           break;

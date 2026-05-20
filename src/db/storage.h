@@ -39,6 +39,7 @@
 #include "fwd.h"
 #include "lmdb/transaction.h"
 #include "lmdb/key_stream.h"
+#include "lmdb/lws_value_stream.h"
 #include "lmdb/value_stream.h"
 #include "wire/msgpack/fwd.h"
 
@@ -54,6 +55,8 @@ namespace db
     MONERO_CURSOR(spends);
     MONERO_CURSOR(images);
     MONERO_CURSOR(confirmed_spends);
+    MONERO_CURSOR(imported_spend_sources);
+    MONERO_CURSOR(pending_spends);
     MONERO_CURSOR(requests);
     MONERO_CURSOR(subaddress_ranges);
     MONERO_CURSOR(subaddress_indexes);
@@ -157,6 +160,14 @@ namespace db
     expect<lmdb::value_stream<crypto::key_image, cursor::close_confirmed_spends>>
       get_confirmed_spend_images(account_id id, cursor::confirmed_spends cur = nullptr) noexcept;
 
+    //! \return Exact source bindings supplied by wallet key-image imports for `id`.
+    expect<lws_lmdb::value_stream<key_image_source, cursor::close_imported_spend_sources>>
+      get_imported_spend_sources(account_id id, cursor::imported_spend_sources cur = nullptr) noexcept;
+
+    //! \return All locally pending spend markers associated with `id`.
+    expect<lws_lmdb::value_stream<pending_spend, cursor::close_pending_spends>>
+      get_pending_spends(account_id id, cursor::pending_spends cur = nullptr) noexcept;
+
     //! \return All `request_info`s.
     expect<lmdb::key_stream<request, request_info, cursor::close_requests>>
       get_requests(cursor::requests cur = nullptr) noexcept;
@@ -202,6 +213,16 @@ namespace db
       std::uint64_t imported;
       std::uint64_t confirmed_spends;
       std::uint64_t unconfirmed;
+      std::uint64_t unique_inputs;
+      std::uint64_t known_spend_inputs;
+      std::uint64_t already_confirmed;
+      std::uint64_t exact_source_candidates;
+      std::uint64_t exact_source_known_spend;
+      std::uint64_t exact_source_unknown_spend;
+      std::uint64_t exact_source_matched_output;
+      std::uint64_t exact_source_missing_output;
+      std::uint64_t exact_source_inserted;
+      std::uint64_t exact_source_already_present;
     };
 
     //! \return A single instance of compiled-in checkpoints for lws
@@ -327,7 +348,11 @@ namespace db
 
     //! Persist imported key images for an account and report confirmation stats.
     expect<import_key_images_result>
-      import_key_images(account_id id, epee::span<const crypto::key_image> images);
+      import_key_images(account_id id, epee::span<const crypto::key_image> images, epee::span<const key_image_source> sources = {});
+
+    //! Persist locally pending spend markers for an account.
+    expect<void>
+      record_pending_spends(account_id id, epee::span<const pending_spend> spends);
 
     /*! Update lookahead where `match` was a matching subaddress on-chain.
       \return The number of new subaddresses added via lookahead, or -1 if
