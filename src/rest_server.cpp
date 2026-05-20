@@ -175,6 +175,7 @@ namespace lws
 
     //! `/daemon_status` and `get_unspent_outs` caches ZMQ result for this long
     constexpr const std::chrono::seconds daemon_cache_timeout{5};
+    constexpr const std::chrono::seconds txpool_overlay_cache_timeout{2};
 
     constexpr const unsigned max_ring_size = 20;
     constexpr const unsigned max_rings = 150;
@@ -427,6 +428,7 @@ namespace lws
     {
       db::output output;
       crypto::hash tx_hash;
+      std::uint64_t daemon_receive_time;
     };
 
     bool hash_equal(const crypto::hash& lhs, const crypto::hash& rhs) noexcept
@@ -444,25 +446,70 @@ namespace lws
       return false;
     }
 
+    expect<std::vector<cryptonote::rpc::tx_in_pool>> fetch_txpool_transactions_cached(
+      const rpc::client& daemon_client)
+    {
+      static boost::mutex sync;
+      static rpc::client txpool_client{};
+      static bool txpool_client_ready = false;
+      static bool cached_valid = false;
+      static std::chrono::steady_clock::time_point cached_at{};
+      static std::vector<cryptonote::rpc::tx_in_pool> cached_transactions{};
+
+      const auto now = std::chrono::steady_clock::now();
+      const boost::lock_guard<boost::mutex> lock{sync};
+      if (cached_valid && now - cached_at < txpool_overlay_cache_timeout)
+        return cached_transactions;
+
+      if (!txpool_client_ready)
+      {
+        auto rpc_client = daemon_client.clone();
+        if (!rpc_client)
+          return rpc_client.error();
+        txpool_client = std::move(*rpc_client);
+        txpool_client_ready = true;
+      }
+
+      cryptonote::rpc::GetTransactionPool::Request txpool_req{};
+      expect<void> sent = txpool_client.send(rpc::client::make_message("get_transaction_pool", txpool_req), std::chrono::seconds{10});
+      if (!sent)
+      {
+        txpool_client = rpc::client{};
+        txpool_client_ready = false;
+        cached_valid = false;
+        return sent.error();
+      }
+
+      auto txpool_raw = txpool_client.get_message(std::chrono::seconds{15});
+      if (!txpool_raw)
+      {
+        txpool_client = rpc::client{};
+        txpool_client_ready = false;
+        cached_valid = false;
+        return txpool_raw.error();
+      }
+
+      auto txpool = rpc::parse_json_response<rpc::get_transaction_pool>(std::move(*txpool_raw));
+      if (!txpool)
+      {
+        cached_valid = false;
+        return txpool.error();
+      }
+
+      cached_transactions = std::move(txpool->transactions);
+      cached_at = now;
+      cached_valid = true;
+      return cached_transactions;
+    }
+
     expect<std::vector<txpool_overlay_match>> fetch_txpool_incoming_overlay(
       const db::account& account,
       const rpc::client& daemon_client,
       const bool debug)
     {
-      auto rpc_client = daemon_client.clone();
-      if (!rpc_client)
-        return rpc_client.error();
-
-      cryptonote::rpc::GetTransactionPool::Request txpool_req{};
-      MONERO_CHECK(rpc_client->send(rpc::client::make_message("get_transaction_pool", txpool_req), std::chrono::seconds{10}));
-
-      auto txpool_raw = rpc_client->get_message(std::chrono::seconds{15});
-      if (!txpool_raw)
-        return txpool_raw.error();
-
-      auto txpool = rpc::parse_json_response<rpc::get_transaction_pool>(std::move(*txpool_raw));
-      if (!txpool)
-        return txpool.error();
+      auto txpool_transactions = fetch_txpool_transactions_cached(daemon_client);
+      if (!txpool_transactions)
+        return txpool_transactions.error();
 
       std::vector<txpool_overlay_match> matches{};
       std::size_t inspected_outputs = 0;
@@ -471,11 +518,12 @@ namespace lws
       crypto::secret_key view_key{};
       static_assert(sizeof(view_key) == sizeof(account.key), "different size keys");
       std::memcpy(std::addressof(unwrap(unwrap(view_key))), std::addressof(account.key), sizeof(view_key));
-      for (const auto& tx_entry : txpool->transactions)
+      for (const auto& tx_entry : *txpool_transactions)
       {
         const cryptonote::transaction& tx = tx_entry.tx;
         if (2 < tx.version)
           continue;
+        const std::uint64_t overlay_timestamp = tx_entry.receive_time ? tx_entry.receive_time : now;
 
         cryptonote::tx_extra_pub_key key{};
         cryptonote::tx_extra_nonce extra_nonce{};
@@ -613,7 +661,7 @@ namespace lws
                 boost::numeric_cast<std::uint32_t>(index),
                 active_pub
               },
-              now,
+              overlay_timestamp,
               tx.unlock_time,
               tx_prefix_hash,
               out_pub_key,
@@ -624,8 +672,20 @@ namespace lws
               cryptonote::get_tx_fee(tx),
               db::address_index{db::major_index::primary, db::minor_index::primary}
             },
-            tx_entry.tx_hash
+            tx_entry.tx_hash,
+            tx_entry.receive_time
           });
+          if (debug)
+          {
+            MINFO("lws-txpool-overlay-time-diagnostic: account_id=" << unsigned(account.id)
+                  << " tx_hash=" << epee::string_tools::pod_to_hex(tx_entry.tx_hash)
+                  << " output_index=" << index
+                  << " amount=" << amount
+                  << " daemon_receive_time=" << tx_entry.receive_time
+                  << " lws_overlay_timestamp=" << overlay_timestamp
+                  << " timestamp_delta_seconds=" << (overlay_timestamp >= tx_entry.receive_time ? overlay_timestamp - tx_entry.receive_time : 0)
+                  << " fallback_used=" << (tx_entry.receive_time == 0));
+          }
           ++matched_outputs;
         }
       }
@@ -633,7 +693,7 @@ namespace lws
       if (debug)
       {
         MINFO("lws-txpool-overlay: account_id=" << unsigned(account.id)
-              << " txpool_txs=" << txpool->transactions.size()
+              << " txpool_txs=" << txpool_transactions->size()
               << " inspected_outputs=" << inspected_outputs
               << " matched_outputs=" << matched_outputs);
       }

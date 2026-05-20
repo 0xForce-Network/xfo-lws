@@ -1,3 +1,5 @@
 /build
 /.cache/
 /build_host/
+/build-local/
+/build-verify/

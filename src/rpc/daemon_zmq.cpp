@@ -335,7 +335,7 @@ namespace cryptonote
 
     static void read_bytes(wire::json_reader& source, tx_in_pool& self)
     {
-      wire::object(source, WIRE_FIELD(tx), WIRE_FIELD(tx_hash));
+      wire::object(source, WIRE_FIELD(tx), WIRE_FIELD(tx_hash), WIRE_FIELD(receive_time));
     }
   } // rpc
 } // cryptonote
