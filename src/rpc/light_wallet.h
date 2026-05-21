@@ -131,6 +131,14 @@ namespace rpc
       : locked_funds(safe_uint64(0)),
         total_received(safe_uint64(0)),
         total_sent(safe_uint64(0)),
+        spent_state_incomplete(false),
+        spent_state_confirmed_images(0),
+        spent_state_selected_spends(0),
+        spent_state_unconfirmed_spends(0),
+        spent_state_unconfirmed_sources(0),
+        spent_state_unconfirmed_source_amount(safe_uint64(0)),
+        spent_state_missing_sources(0),
+        spent_state_hint(),
         scanned_height(0),
         scanned_block_height(0),
         start_height(0),
@@ -144,6 +152,14 @@ namespace rpc
     safe_uint64 locked_funds;
     safe_uint64 total_received;
     safe_uint64 total_sent;
+    bool spent_state_incomplete;
+    std::uint64_t spent_state_confirmed_images;
+    std::uint64_t spent_state_selected_spends;
+    std::uint64_t spent_state_unconfirmed_spends;
+    std::uint64_t spent_state_unconfirmed_sources;
+    safe_uint64 spent_state_unconfirmed_source_amount;
+    std::uint64_t spent_state_missing_sources;
+    std::string spent_state_hint;
     std::uint64_t scanned_height;
     std::uint64_t scanned_block_height;
     std::uint64_t start_height;
@@ -314,6 +330,16 @@ namespace rpc
     safe_uint64 unconfirmed;
   };
   void write_bytes(wire::json_writer&, const import_key_images_response&);
+
+  struct request_rescan_response
+  {
+    request_rescan_response() = delete;
+    std::string status;
+    safe_uint64 previous_scan_height;
+    safe_uint64 target_height;
+    bool request_fulfilled;
+  };
+  void write_bytes(wire::json_writer&, const request_rescan_response&);
 
 
   struct login_request

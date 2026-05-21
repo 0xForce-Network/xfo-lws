@@ -301,7 +301,7 @@ namespace lws
     }
 
     constexpr const std::uint64_t pending_spend_ttl_seconds = 24 * 60 * 60;
-    constexpr const char* lws_spent_state_patch_marker = "lws-spent-state-v20260520-key-image-dedup-exact-source";
+    constexpr const char* lws_spent_state_patch_marker = "lws-spent-state-v20260521-change-lock-diagnostics";
 
     std::uint64_t unix_timestamp_now() noexcept
     {
@@ -406,6 +406,19 @@ namespace lws
       for (const crypto::key_image& image : images)
       {
         if (confirmed_images.count(image) != 0)
+          return true;
+      }
+      return false;
+    }
+
+    bool has_confirmed_spend_image_without_imported_source(
+      const std::vector<crypto::key_image>& images,
+      const std::set<crypto::key_image, key_image_less>& confirmed_images,
+      const std::map<crypto::key_image, db::key_image_source, key_image_less>& imported_sources) noexcept
+    {
+      for (const crypto::key_image& image : images)
+      {
+        if (confirmed_images.count(image) != 0 && imported_sources.count(image) == 0)
           return true;
       }
       return false;
@@ -736,13 +749,34 @@ namespace lws
         daemon_raw_response.find("INVALID_INPUT") != std::string::npos;
     }
 
-    bool is_locked(std::uint64_t unlock_time, db::block_id last, db::block_id tx_height) noexcept
+    std::uint64_t blocks_until_unlocked(std::uint64_t unlock_time, db::block_id last, db::block_id tx_height) noexcept
     {
       if (unlock_time > CRYPTONOTE_MAX_BLOCK_NUMBER)
-        return std::chrono::seconds{unlock_time} > std::chrono::system_clock::now().time_since_epoch() + std::chrono::seconds{CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_SECONDS_V2};
-      if (unlock_time > to_uint(last) - 1 + CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_BLOCKS)
-        return true;
-      return to_uint(tx_height) + CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE > to_uint(last);
+      {
+        const auto allowed = std::chrono::duration_cast<std::chrono::seconds>(
+          std::chrono::system_clock::now().time_since_epoch() + std::chrono::seconds{CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_SECONDS_V2}
+        );
+        const std::chrono::seconds unlock_seconds{unlock_time};
+        if (unlock_seconds <= allowed)
+          return 0;
+        const auto delta = unlock_seconds - allowed;
+        return std::max<std::uint64_t>(1, std::uint64_t((delta.count() + DIFFICULTY_TARGET_V2 - 1) / DIFFICULTY_TARGET_V2));
+      }
+
+      const std::uint64_t last_height = to_uint(last);
+      const std::uint64_t allowed_height = last_height == 0 ? 0 : last_height - 1 + CRYPTONOTE_LOCKED_TX_ALLOWED_DELTA_BLOCKS;
+      if (unlock_time > allowed_height)
+        return unlock_time - allowed_height;
+
+      const std::uint64_t spendable_height = to_uint(tx_height) + CRYPTONOTE_DEFAULT_TX_SPENDABLE_AGE;
+      if (spendable_height <= last_height)
+        return 0;
+      return spendable_height - last_height;
+    }
+
+    bool is_locked(std::uint64_t unlock_time, db::block_id last, db::block_id tx_height) noexcept
+    {
+      return blocks_until_unlocked(unlock_time, last, tx_height) != 0;
     }
 
     bool is_hidden(db::account_status status) noexcept
@@ -1198,6 +1232,7 @@ namespace lws
 
         std::vector<db::output> output_rows{};
         output_rows.reserve(outputs->count());
+        std::map<db::output_id, db::output::spend_meta_, output_id_less> output_meta_by_id{};
 
         for (auto output = outputs->make_iterator(); !output.is_end(); ++output)
         {
@@ -1205,6 +1240,7 @@ namespace lws
           const db::output::spend_meta_ meta = out.spend_meta;
 
           output_rows.push_back(out);
+          output_meta_by_id.emplace(out.spend_meta.id, out.spend_meta);
 
           resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + meta.amount);
           if (is_locked(out.unlock_time, last->id, out.link.height))
@@ -1218,6 +1254,7 @@ namespace lws
           if (output_exists_in_rows(output_rows, match))
             continue;
           output_rows.push_back(match.output);
+          output_meta_by_id.emplace(match.output.spend_meta.id, match.output.spend_meta);
           resp.total_received = rpc::safe_uint64(std::uint64_t(resp.total_received) + match.output.spend_meta.amount);
           resp.locked_funds = rpc::safe_uint64(std::uint64_t(resp.locked_funds) + match.output.spend_meta.amount);
           if (std::numeric_limits<std::uint64_t>::max() - txpool_overlay_amount < match.output.spend_meta.amount)
@@ -1240,12 +1277,23 @@ namespace lws
         std::size_t missing_source_count = 0;
         std::size_t imported_source_candidate_count = 0;
         std::size_t unconfirmed_spend_samples = 0;
+        std::set<db::output_id, output_id_less> unconfirmed_spend_sources{};
+        std::uint64_t unconfirmed_spend_source_amount = 0;
+        std::set<crypto::key_image, key_image_less> spend_images_present{};
         std::map<crypto::key_image, confirmed_spend_choice, key_image_less> confirmed_spend_choices{};
         for (const auto& spend : spends->make_range())
         {
+          spend_images_present.insert(spend.image);
           if (confirmed_images.count(spend.image) == 0)
           {
             ++unconfirmed_spend_count;
+            const auto candidate_source = output_meta_by_id.find(spend.source);
+            if (candidate_source != output_meta_by_id.end() && unconfirmed_spend_sources.insert(spend.source).second)
+            {
+              if (std::numeric_limits<std::uint64_t>::max() - unconfirmed_spend_source_amount < candidate_source->second.amount)
+                return {lws::error::bad_daemon_response};
+              unconfirmed_spend_source_amount += candidate_source->second.amount;
+            }
             if (data.global->options.debug && unconfirmed_spend_samples < 8)
             {
               MINFO("/get_address_info unconfirmed spend sample[" << unconfirmed_spend_samples << "]: key_image="
@@ -1262,10 +1310,15 @@ namespace lws
           else
             ++confirmed_spend_count;
 
+          const auto source = imported_source_map.find(spend.image);
+          if (source == imported_source_map.end())
+          {
+            ++missing_source_count;
+            continue;
+          }
+
           const auto* output = find_output_by_imported_source(output_rows, imported_source_map, spend.image);
           const bool imported_source = output != nullptr;
-          if (!output)
-            output = find_output_by_id(output_rows, spend.source);
           if (!output)
           {
             ++missing_source_count;
@@ -1280,6 +1333,43 @@ namespace lws
             confirmed_spend_choices.emplace(spend.image, std::move(choice));
           else if (should_replace_confirmed_spend_choice(existing->second, choice))
             existing->second = std::move(choice);
+        }
+
+        std::size_t imported_source_without_spend_count = 0;
+        std::size_t imported_source_without_spend_with_output_count = 0;
+        std::size_t imported_source_without_spend_missing_output_count = 0;
+        std::size_t imported_source_without_spend_samples = 0;
+        std::uint64_t imported_source_without_spend_amount = 0;
+        for (const auto& source_entry : imported_source_map)
+        {
+          if (spend_images_present.count(source_entry.first) != 0)
+            continue;
+
+          ++imported_source_without_spend_count;
+          const db::output* imported_output = find_output_by_imported_source(output_rows, imported_source_map, source_entry.first);
+          if (imported_output)
+          {
+            ++imported_source_without_spend_with_output_count;
+            if (std::numeric_limits<std::uint64_t>::max() - imported_source_without_spend_amount < imported_output->spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            imported_source_without_spend_amount += imported_output->spend_meta.amount;
+          }
+          else
+            ++imported_source_without_spend_missing_output_count;
+
+          if (data.global->options.debug && imported_source_without_spend_samples < 16)
+          {
+            MINFO("/get_address_info imported exact source without spend sample[" << imported_source_without_spend_samples << "]: key_image="
+                  << epee::string_tools::pod_to_hex(source_entry.first)
+                  << " output_found=" << (imported_output != nullptr)
+                  << " source_global_index=" << source_entry.second.source.low
+                  << " source_amount_bucket=" << source_entry.second.source.high
+                  << " source_out_index=" << source_entry.second.out_index
+                  << " source_tx_hash=" << epee::string_tools::pod_to_hex(source_entry.second.tx_hash)
+                  << " source_pub=" << epee::string_tools::pod_to_hex(source_entry.second.pub)
+                  << " output_amount=" << (imported_output ? imported_output->spend_meta.amount : 0));
+            ++imported_source_without_spend_samples;
+          }
         }
 
         std::set<db::output_id, output_id_less> total_sent_sources{};
@@ -1297,6 +1387,15 @@ namespace lws
           resp.spent_outputs.push_back(rpc::transaction_spend{choice.meta, choice.spend});
         }
         resp.total_sent = rpc::safe_uint64(total_sent);
+        resp.spent_state_confirmed_images = confirmed_images.size();
+        resp.spent_state_selected_spends = total_sent_sources.size();
+        resp.spent_state_unconfirmed_spends = unconfirmed_spend_count;
+        resp.spent_state_unconfirmed_sources = unconfirmed_spend_sources.size();
+        resp.spent_state_unconfirmed_source_amount = rpc::safe_uint64(unconfirmed_spend_source_amount);
+        resp.spent_state_missing_sources = missing_source_count;
+        resp.spent_state_incomplete = 0 < unconfirmed_spend_count || 0 < missing_source_count;
+        if (resp.spent_state_incomplete)
+          resp.spent_state_hint = "spent_state_incomplete: total_sent uses confirmed imported key images only; import key images or rescan this account before trusting available balance against wallet-rpc";
 
         if (data.global->options.debug)
         {
@@ -1311,8 +1410,15 @@ namespace lws
                 << " unique_confirmed_sources=" << total_sent_sources.size()
                 << " imported_exact_sources=" << imported_source_count
                 << " imported_exact_source_candidates=" << imported_source_candidate_count
+                << " imported_exact_sources_without_spend=" << imported_source_without_spend_count
+                << " imported_exact_sources_without_spend_with_output=" << imported_source_without_spend_with_output_count
+                << " imported_exact_sources_without_spend_missing_output=" << imported_source_without_spend_missing_output_count
+                << " imported_exact_sources_without_spend_amount=" << imported_source_without_spend_amount
                 << " unconfirmed_spends=" << unconfirmed_spend_count
+                << " unconfirmed_spend_sources=" << unconfirmed_spend_sources.size()
+                << " unconfirmed_spend_source_amount=" << unconfirmed_spend_source_amount
                 << " missing_source_spends=" << missing_source_count
+                << " spent_state_incomplete=" << resp.spent_state_incomplete
                 << " total_received=" << std::uint64_t(resp.total_received)
                 << " total_sent=" << std::uint64_t(resp.total_sent)
                 << " locked_funds=" << std::uint64_t(resp.locked_funds)
@@ -1490,10 +1596,15 @@ namespace lws
           else
             ++txs_confirmed_spend_count;
 
+          const auto source = imported_source_map.find(spend.image);
+          if (source == imported_source_map.end())
+          {
+            ++txs_missing_source_count;
+            continue;
+          }
+
           const auto* output = find_output_by_imported_source(output_rows, imported_source_map, spend.image);
           const bool imported_source = output != nullptr;
-          if (!output)
-            output = find_output_by_id(output_rows, spend.source);
           if (!output)
           {
             ++txs_missing_source_count;
@@ -2048,12 +2159,25 @@ namespace lws
         for (const auto& image : confirmed->make_range())
           confirmed_images.insert(image);
 
+        auto imported_sources = user->second.get_imported_spend_sources(user->first.id);
+        if (!imported_sources)
+          return imported_sources.error();
+
+        std::map<crypto::key_image, db::key_image_source, key_image_less> imported_source_map{};
+        for (const auto& source : imported_sources->make_range())
+          imported_source_map.emplace(source.image, source);
+
         std::set<db::output_id, output_id_less> confirmed_sources{};
         for (const auto& spend : spends->make_range())
         {
           if (confirmed_images.count(spend.image) == 0)
             continue;
-          confirmed_sources.insert(spend.source);
+
+          const auto imported = imported_source_map.find(spend.image);
+          if (imported != imported_source_map.end())
+            confirmed_sources.insert(imported->second.source);
+          else
+            confirmed_sources.insert(spend.source);
         }
 
         auto pending_stream = user->second.get_pending_spends(user->first.id);
@@ -2082,8 +2206,8 @@ namespace lws
         }
 
         std::uint64_t received = 0;
-        std::uint64_t candidate_spent_hidden_amount = 0;
-        std::size_t candidate_spent_hidden_count = 0;
+        std::uint64_t possible_spend_candidate_amount = 0;
+        std::size_t possible_spend_candidate_count = 0;
         std::uint64_t dust_or_mixin_skipped_amount = 0;
         std::size_t dust_or_mixin_skipped_count = 0;
         std::uint64_t confirmed_source_skipped_amount = 0;
@@ -2114,22 +2238,17 @@ namespace lws
             return spend_images.error();
 
           const bool confirmed_image_match = has_confirmed_spend_image(*spend_images, confirmed_images);
+          const bool confirmed_image_without_exact_source_match =
+            has_confirmed_spend_image_without_imported_source(*spend_images, confirmed_images, imported_source_map);
           if (!spend_images->empty())
           {
-            ++candidate_spent_hidden_count;
-            if (std::numeric_limits<std::uint64_t>::max() - candidate_spent_hidden_amount < out.spend_meta.amount)
+            ++possible_spend_candidate_count;
+            if (std::numeric_limits<std::uint64_t>::max() - possible_spend_candidate_amount < out.spend_meta.amount)
               return {lws::error::bad_daemon_response};
-            candidate_spent_hidden_amount += out.spend_meta.amount;
-            if (confirmed_image_match)
-            {
-              ++confirmed_image_skipped_count;
-              if (std::numeric_limits<std::uint64_t>::max() - confirmed_image_skipped_amount < out.spend_meta.amount)
-                return {lws::error::bad_daemon_response};
-              confirmed_image_skipped_amount += out.spend_meta.amount;
-            }
+            possible_spend_candidate_amount += out.spend_meta.amount;
             if (debug && candidate_spent_samples < 8)
             {
-              MINFO("/get_unspent_outs possible-spend skipped sample[" << candidate_spent_samples << "]: tx_hash="
+              MINFO("/get_unspent_outs possible-spend candidate sample[" << candidate_spent_samples << "]: tx_hash="
                     << epee::string_tools::pod_to_hex(out.link.tx_hash)
                     << " global_index=" << out.spend_meta.id.low
                     << " amount_bucket=" << out.spend_meta.id.high
@@ -2137,15 +2256,25 @@ namespace lws
                     << " amount=" << out.spend_meta.amount
                     << " possible_spend_key_images=" << spend_images->size()
                     << " confirmed_image_match=" << confirmed_image_match
+                    << " confirmed_image_without_exact_source_match=" << confirmed_image_without_exact_source_match
                     << " confirmed_sources_match=" << (confirmed_sources.count(out.spend_meta.id) != 0));
               for (std::size_t image_index = 0; image_index < spend_images->size(); ++image_index)
               {
                 MINFO("/get_unspent_outs possible-spend image sample[" << candidate_spent_samples << "][" << image_index << "]: key_image="
                       << epee::string_tools::pod_to_hex((*spend_images)[image_index])
-                      << " confirmed=" << (confirmed_images.count((*spend_images)[image_index]) != 0));
+                      << " confirmed=" << (confirmed_images.count((*spend_images)[image_index]) != 0)
+                      << " imported_exact_source=" << (imported_source_map.count((*spend_images)[image_index]) != 0));
               }
               ++candidate_spent_samples;
             }
+          }
+
+          if (confirmed_image_without_exact_source_match)
+          {
+            ++confirmed_image_skipped_count;
+            if (std::numeric_limits<std::uint64_t>::max() - confirmed_image_skipped_amount < out.spend_meta.amount)
+              return {lws::error::bad_daemon_response};
+            confirmed_image_skipped_amount += out.spend_meta.amount;
             continue;
           }
 
@@ -2206,9 +2335,10 @@ namespace lws
           MINFO("/get_unspent_outs selection summary: outputs=" << outputs->count()
                 << " patch_marker=" << lws_spent_state_patch_marker
                 << " balance_policy=not_applicable"
-                << " unspent_policy=skip_any_possible_spend_image"
+                << " unspent_policy=skip_confirmed_key_image_or_exact_source_only"
                 << " spends=" << spends->count()
                 << " confirmed_spend_images=" << confirmed_images.size()
+                << " imported_exact_sources=" << imported_source_map.size()
                 << " confirmed_sources=" << confirmed_sources.size()
                 << " pending_spends_loaded=" << pending_loaded_count
                 << " pending_spends_active=" << pending_active_count
@@ -2225,8 +2355,8 @@ namespace lws
                 << " returned_amount=" << received
                 << " clean_returned_count=" << clean_returned_count
                 << " clean_returned_amount=" << clean_returned_amount
-                << " candidate_spent_hidden_count=" << candidate_spent_hidden_count
-                << " candidate_spent_hidden_amount=" << candidate_spent_hidden_amount
+                << " possible_spend_candidate_count=" << possible_spend_candidate_count
+                << " possible_spend_candidate_amount=" << possible_spend_candidate_amount
                 << " requested_amount=" << std::uint64_t(req.amount)
                 << " dust_threshold=" << std::uint64_t(*req.dust_threshold)
                 << " requested_mixin=" << std::uint64_t(*req.mixin));
@@ -2672,6 +2802,7 @@ namespace lws
               << " exact_source_missing_output=" << result->exact_source_missing_output
               << " exact_source_inserted=" << result->exact_source_inserted
               << " exact_source_already_present=" << result->exact_source_already_present
+              << " exact_source_replaced=" << result->exact_source_replaced
               << " initial_reader_active=0");
 
         maybe_auto_rescan_after_key_images(*data.global, account, *result);
@@ -2724,7 +2855,8 @@ namespace lws
                 << " exact_source_matched_output=" << result->exact_source_matched_output
                 << " exact_source_missing_output=" << result->exact_source_missing_output
                 << " exact_source_inserted=" << result->exact_source_inserted
-                << " exact_source_already_present=" << result->exact_source_already_present);
+                << " exact_source_already_present=" << result->exact_source_already_present
+                << " exact_source_replaced=" << result->exact_source_replaced);
         }
 
         return response{
@@ -2732,6 +2864,53 @@ namespace lws
           rpc::safe_uint64(result->confirmed_spends),
           rpc::safe_uint64(result->unconfirmed)
         };
+      }
+    };
+
+    struct request_rescan
+    {
+      using request = rpc::account_credentials;
+      using response = rpc::request_rescan_response;
+
+      static expect<response> handle(request req, connection_data& data, std::function<async_complete>&&)
+      {
+        db::account account{};
+        {
+          auto user = open_account(req, data.global->disk.clone());
+          if (!user)
+            return user.error();
+
+          data.passed_login = true;
+          account = user->first;
+          user->second.finish_read();
+        }
+
+        const db::block_id target = account.start_height;
+        if (account.scan_height <= target)
+        {
+          MINFO("/request_rescan skipped: account_id=" << unsigned(account.id)
+                << " scan_height=" << std::uint64_t(account.scan_height)
+                << " target_height=" << std::uint64_t(target)
+                << " reason=already_at_or_before_target");
+          return response{"Already queued", rpc::safe_uint64(std::uint64_t(account.scan_height)), rpc::safe_uint64(std::uint64_t(target)), true};
+        }
+
+        const std::array<db::account_address, 1> addresses{{account.address}};
+        const auto rescanned = data.global->disk.clone().rescan(target, epee::to_span(addresses));
+        if (!rescanned)
+        {
+          MWARNING("/request_rescan failed: account_id=" << unsigned(account.id)
+                   << " from_scan_height=" << std::uint64_t(account.scan_height)
+                   << " target_height=" << std::uint64_t(target)
+                   << " error=" << rescanned.error().message());
+          return rescanned.error();
+        }
+
+        MINFO("/request_rescan queued: account_id=" << unsigned(account.id)
+              << " from_scan_height=" << std::uint64_t(account.scan_height)
+              << " target_height=" << std::uint64_t(target)
+              << " updated_addresses=" << rescanned->size());
+        return response{"Queued", rpc::safe_uint64(std::uint64_t(account.scan_height)), rpc::safe_uint64(std::uint64_t(target)), !rescanned->empty()};
       }
     };
 
@@ -3484,6 +3663,7 @@ namespace lws
       {"/multisig/transactions",     call<multisig_txs>,                      2 * 1024, false},
       {"/multisig/wallets",          call<multisig_list_wallets>,             1024,     false},
       {"/provision_subaddrs",    call<provision_subaddrs>, 2 * 1024, false},
+      {"/request_rescan",        call<request_rescan>,     2 * 1024, false},
       {"/submit_raw_tx",         call<submit_raw_tx>,    512 * 1024,  true},
       {"/upsert_subaddrs",       call<upsert_subaddrs>,   10 * 1024, false}
     };

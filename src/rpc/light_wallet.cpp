@@ -265,6 +265,14 @@ namespace lws
       WIRE_FIELD_COPY(locked_funds),
       WIRE_FIELD_COPY(total_received),
       WIRE_FIELD_COPY(total_sent),
+      WIRE_FIELD_COPY(spent_state_incomplete),
+      WIRE_FIELD_COPY(spent_state_confirmed_images),
+      WIRE_FIELD_COPY(spent_state_selected_spends),
+      WIRE_FIELD_COPY(spent_state_unconfirmed_spends),
+      WIRE_FIELD_COPY(spent_state_unconfirmed_sources),
+      WIRE_FIELD_COPY(spent_state_unconfirmed_source_amount),
+      WIRE_FIELD_COPY(spent_state_missing_sources),
+      WIRE_FIELD_COPY(spent_state_hint),
       WIRE_FIELD_COPY(scanned_height),
       WIRE_FIELD_COPY(scanned_block_height),
       WIRE_FIELD_COPY(start_height),
@@ -456,6 +464,16 @@ namespace lws
       WIRE_FIELD_COPY(imported),
       WIRE_FIELD_COPY(confirmed_spends),
       WIRE_FIELD_COPY(unconfirmed)
+    );
+  }
+
+  void rpc::write_bytes(wire::json_writer& dest, const request_rescan_response& self)
+  {
+    wire::object(dest,
+      WIRE_FIELD_COPY(status),
+      WIRE_FIELD_COPY(previous_scan_height),
+      WIRE_FIELD_COPY(target_height),
+      WIRE_FIELD_COPY(request_fulfilled)
     );
   }
 

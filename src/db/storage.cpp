@@ -3611,6 +3611,8 @@ namespace db
           std::uint64_t candidates;
           std::uint64_t known_spend_candidates;
           std::uint64_t unknown_spend_candidates;
+          std::uint64_t unknown_spend_matched_outputs;
+          std::uint64_t unknown_spend_missing_outputs;
           std::uint64_t matched_outputs;
           std::uint64_t missing_outputs;
           std::uint64_t inserted;
@@ -3631,6 +3633,20 @@ namespace db
           {
             ++out.exact_source_unknown_spend;
             ++summary.unknown_spend_candidates;
+            bool unknown_matched = false;
+            for (const auto& out_row : output_rows)
+            {
+              if (out_row.spend_meta.id.low != imported.source.low ||
+                  out_row.spend_meta.index != imported.out_index ||
+                  std::memcmp(std::addressof(out_row.link.tx_hash), std::addressof(imported.tx_hash), sizeof(crypto::hash)) != 0 ||
+                  std::memcmp(std::addressof(out_row.pub), std::addressof(imported.pub), sizeof(crypto::public_key)) != 0)
+                continue;
+              unknown_matched = true;
+              ++summary.unknown_spend_matched_outputs;
+              break;
+            }
+            if (!unknown_matched)
+              ++summary.unknown_spend_missing_outputs;
             continue;
           }
 
@@ -3641,7 +3657,6 @@ namespace db
           for (const auto& out_row : output_rows)
           {
             if (out_row.spend_meta.id.low != imported.source.low ||
-                out_row.spend_meta.amount != imported.source.high ||
                 out_row.spend_meta.index != imported.out_index ||
                 std::memcmp(std::addressof(out_row.link.tx_hash), std::addressof(imported.tx_hash), sizeof(crypto::hash)) != 0 ||
                 std::memcmp(std::addressof(out_row.pub), std::addressof(imported.pub), sizeof(crypto::public_key)) != 0)
@@ -3653,6 +3668,61 @@ namespace db
             key_image_source resolved = imported;
             resolved.source = out_row.spend_meta.id;
             MDB_val value = lmdb::to_val(resolved);
+            std::vector<key_image_source> existing_sources{};
+            MDB_val existing_key = lmdb::to_val(id);
+            MDB_val existing_value{};
+            int existing_err = mdb_cursor_get(imported_sources_cur.get(), &existing_key, &existing_value, MDB_SET_KEY);
+            for (;;)
+            {
+              if (existing_err)
+              {
+                if (existing_err == MDB_NOTFOUND)
+                  break;
+                return log_lmdb_error(existing_err, __LINE__, __FILE__);
+              }
+
+              const auto existing = imported_spend_sources.get_value<key_image_source>(existing_value);
+              if (!existing)
+                return existing.error();
+              if (std::memcmp(std::addressof(existing->image), std::addressof(resolved.image), sizeof(crypto::key_image)) == 0)
+                existing_sources.push_back(*existing);
+              existing_err = mdb_cursor_get(imported_sources_cur.get(), &existing_key, &existing_value, MDB_NEXT_DUP);
+            }
+
+            bool already_present = false;
+            for (const auto& existing : existing_sources)
+            {
+              if (std::memcmp(std::addressof(existing), std::addressof(resolved), sizeof(key_image_source)) == 0)
+              {
+                already_present = true;
+                break;
+              }
+            }
+
+            if (already_present)
+            {
+              ++out.exact_source_already_present;
+              ++summary.already_present;
+              break;
+            }
+
+            for (const auto& existing : existing_sources)
+            {
+              existing_key = lmdb::to_val(id);
+              existing_value = lmdb::to_val(existing);
+              const int del_err = mdb_cursor_get(imported_sources_cur.get(), &existing_key, &existing_value, MDB_GET_BOTH);
+              if (del_err == MDB_NOTFOUND)
+                continue;
+              if (del_err)
+                return log_lmdb_error(del_err, __LINE__, __FILE__);
+              const int erase_err = mdb_cursor_del(imported_sources_cur.get(), 0);
+              if (erase_err)
+                return log_lmdb_error(erase_err, __LINE__, __FILE__);
+              ++out.exact_source_replaced;
+            }
+
+            key = lmdb::to_val(id);
+            value = lmdb::to_val(resolved);
             const int err = mdb_cursor_put(imported_sources_cur.get(), &key, &value, MDB_NODUPDATA);
             if (err && err != MDB_KEYEXIST)
               return log_lmdb_error(err, __LINE__, __FILE__);
@@ -3686,7 +3756,8 @@ namespace db
               << " exact_source_matched_output=" << out.exact_source_matched_output
               << " exact_source_missing_output=" << out.exact_source_missing_output
               << " exact_source_inserted=" << out.exact_source_inserted
-              << " exact_source_already_present=" << out.exact_source_already_present);
+              << " exact_source_already_present=" << out.exact_source_already_present
+              << " exact_source_replaced=" << out.exact_source_replaced);
 
         for (const auto& item : source_summaries)
         {
@@ -3701,6 +3772,8 @@ namespace db
                 << " candidates=" << summary.candidates
                 << " known_spend_candidates=" << summary.known_spend_candidates
                 << " unknown_spend_candidates=" << summary.unknown_spend_candidates
+                << " unknown_spend_matched_outputs=" << summary.unknown_spend_matched_outputs
+                << " unknown_spend_missing_outputs=" << summary.unknown_spend_missing_outputs
                 << " matched_outputs=" << summary.matched_outputs
                 << " missing_outputs=" << summary.missing_outputs
                 << " inserted=" << summary.inserted

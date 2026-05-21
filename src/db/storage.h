@@ -223,6 +223,7 @@ namespace db
       std::uint64_t exact_source_missing_output;
       std::uint64_t exact_source_inserted;
       std::uint64_t exact_source_already_present;
+      std::uint64_t exact_source_replaced;
     };
 
     //! \return A single instance of compiled-in checkpoints for lws
