@@ -56,17 +56,25 @@
 #include <boost/thread/tss.hpp>
 #include <boost/utility/string_ref.hpp>
 #include <chrono>
+#include <cctype>
+#include <cstdlib>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include "byte_slice.h"
 #include "byte_stream.h"          // monero/contrib/epee/include
 #include "common/error.h"          // monero/src
 #include "common/expect.h"         // monero/src
@@ -104,6 +112,10 @@
 #include "util/transactions.h"
 #include "wire/adapted/crypto.h"
 #include "wire/json.h"
+#include "wire/vector.h"
+#include "wire/wrapper/array.h"
+#include "wire/wrapper/defaulted.h"
+#include "wire/wrappers_impl.h"
 
 namespace lws
 {
@@ -179,6 +191,462 @@ namespace lws
 
     constexpr const unsigned max_ring_size = 20;
     constexpr const unsigned max_rings = 150;
+
+    struct lws_unstake_txset_record
+    {
+      std::string owner_address;
+      std::string wallet_id;
+      std::string multisig_address;
+      std::string txset_id;
+      std::string tx_data_hash;
+      std::string miner_address;
+      std::string state;
+      std::uint32_t collected_signatures;
+      std::uint32_t required_signatures;
+      std::string signed_tx_data_hash;
+      std::string submitted_tx_hash;
+      std::uint64_t created_at;
+      std::uint64_t updated_at;
+    };
+
+    struct lws_multisig_kex_peer
+    {
+      std::string participant;
+      std::string multisig_info;
+      std::uint32_t round;
+      std::uint64_t updated_at;
+    };
+
+    struct lws_multisig_kex_record
+    {
+      std::string wallet_id;
+      std::string context;
+      std::uint32_t threshold;
+      std::uint32_t total;
+      std::vector<std::string> participants;
+      std::unordered_map<std::string, lws_multisig_kex_peer> peers;
+      std::string address;
+      std::string state;
+      std::uint64_t created_at;
+      std::uint64_t updated_at;
+    };
+
+    struct lws_multisig_kex_peer_snapshot
+    {
+      std::string participant;
+      std::string multisig_info;
+      std::uint32_t round;
+      std::uint64_t updated_at;
+    };
+
+    struct lws_multisig_kex_record_snapshot
+    {
+      std::string wallet_id;
+      std::string context;
+      std::uint32_t threshold;
+      std::uint32_t total;
+      std::vector<std::string> participants;
+      std::vector<lws_multisig_kex_peer_snapshot> peers;
+      std::string address;
+      std::string state;
+      std::uint64_t created_at;
+      std::uint64_t updated_at;
+    };
+
+    struct lws_multisig_kex_registry_snapshot
+    {
+      std::vector<lws_multisig_kex_record_snapshot> records;
+    };
+
+    constexpr const std::size_t lws_unstake_txsets_max_entries = 128;
+    constexpr const std::uint64_t lws_unstake_txset_ttl_seconds = 60 * 60;
+    std::mutex lws_unstake_txsets_mutex;
+    std::unordered_map<std::string, lws_unstake_txset_record> lws_unstake_txsets;
+
+    constexpr const std::size_t lws_multisig_kex_max_entries = 128;
+    constexpr const std::uint64_t lws_multisig_kex_ttl_seconds = 60 * 60;
+    using max_lws_multisig_kex_records = wire::max_element_count<256>;
+    using max_lws_multisig_kex_participants = wire::max_element_count<8>;
+    using max_lws_multisig_kex_peers = wire::max_element_count<8>;
+    std::mutex lws_multisig_kex_mutex;
+    std::unordered_map<std::string, lws_multisig_kex_record> lws_multisig_kex_records;
+
+    void read_bytes(wire::json_reader& source, lws_multisig_kex_peer_snapshot& self)
+    {
+      wire::object(source,
+        WIRE_FIELD(participant),
+        WIRE_FIELD(multisig_info),
+        WIRE_FIELD(round),
+        WIRE_FIELD(updated_at)
+      );
+    }
+
+    void write_bytes(wire::json_writer& dest, const lws_multisig_kex_peer_snapshot& self)
+    {
+      wire::object(dest,
+        WIRE_FIELD(participant),
+        WIRE_FIELD(multisig_info),
+        WIRE_FIELD(round),
+        WIRE_FIELD(updated_at)
+      );
+    }
+
+    void read_bytes(wire::json_reader& source, lws_multisig_kex_record_snapshot& self)
+    {
+      wire::object(source,
+        WIRE_FIELD(wallet_id),
+        WIRE_FIELD(context),
+        WIRE_FIELD(threshold),
+        WIRE_FIELD(total),
+        WIRE_FIELD_ARRAY(participants, max_lws_multisig_kex_participants),
+        WIRE_FIELD_ARRAY(peers, max_lws_multisig_kex_peers),
+        WIRE_FIELD_DEFAULTED(address, std::string{}),
+        WIRE_FIELD(state),
+        WIRE_FIELD(created_at),
+        WIRE_FIELD(updated_at)
+      );
+    }
+
+    void write_bytes(wire::json_writer& dest, const lws_multisig_kex_record_snapshot& self)
+    {
+      wire::object(dest,
+        WIRE_FIELD(wallet_id),
+        WIRE_FIELD(context),
+        WIRE_FIELD(threshold),
+        WIRE_FIELD(total),
+        WIRE_FIELD(participants),
+        WIRE_FIELD(peers),
+        WIRE_FIELD(address),
+        WIRE_FIELD(state),
+        WIRE_FIELD(created_at),
+        WIRE_FIELD(updated_at)
+      );
+    }
+
+    void read_bytes(wire::json_reader& source, lws_multisig_kex_registry_snapshot& self)
+    {
+      wire::object(source,
+        WIRE_FIELD_ARRAY(records, max_lws_multisig_kex_records)
+      );
+    }
+
+    void write_bytes(wire::json_writer& dest, const lws_multisig_kex_registry_snapshot& self)
+    {
+      wire::object(dest,
+        WIRE_FIELD(records)
+      );
+    }
+
+    std::uint64_t txset_unix_now() noexcept
+    {
+      return std::uint64_t(std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()
+      ).count());
+    }
+
+    std::string env_or_empty(const char* const name)
+    {
+      const char* const value = std::getenv(name);
+      return value == nullptr ? std::string{} : std::string{value};
+    }
+
+    std::string lws_multisig_kex_storage_path()
+    {
+      const std::string configured = env_or_empty("XFO_LWS_KEX_REGISTRY_PATH");
+      return configured.empty() ? std::string{"/var/data/xfo-lws-db/multisig_kex_registry.json"} : configured;
+    }
+
+    std::string expected_kex_token_for_participant(const std::string& participant)
+    {
+      if (participant == "oracle")
+        return env_or_empty("XFO_LWS_ORACLE_KEX_TOKEN");
+      if (participant == "dao")
+        return env_or_empty("XFO_LWS_DAO_KEX_TOKEN");
+      if (participant == "pool")
+        return env_or_empty("XFO_LWS_POOL_KEX_TOKEN");
+      return {};
+    }
+
+    bool is_internal_kex_participant(const std::string& participant) noexcept
+    {
+      return participant == "oracle" || participant == "dao" || participant == "pool";
+    }
+
+    bool has_valid_kex_participant_auth(const std::string& participant, const std::string& auth_token)
+    {
+      if (!is_internal_kex_participant(participant))
+        return true;
+      const std::string expected = expected_kex_token_for_participant(participant);
+      return !expected.empty() && auth_token == expected;
+    }
+
+    std::uint64_t kex_unix_seconds(const std::uint64_t timestamp) noexcept
+    {
+      if (timestamp > 100000000000ULL)
+        return timestamp / 1000;
+      return timestamp;
+    }
+
+    lws_multisig_kex_registry_snapshot snapshot_lws_multisig_kex_locked()
+    {
+      lws_multisig_kex_registry_snapshot snapshot{};
+      snapshot.records.reserve(lws_multisig_kex_records.size());
+      for (const auto& entry : lws_multisig_kex_records)
+      {
+        lws_multisig_kex_record_snapshot record{};
+        record.wallet_id = entry.second.wallet_id;
+        record.context = entry.second.context;
+        record.threshold = entry.second.threshold;
+        record.total = entry.second.total;
+        record.participants = entry.second.participants;
+        record.address = entry.second.address;
+        record.state = entry.second.state;
+        record.created_at = entry.second.created_at;
+        record.updated_at = entry.second.updated_at;
+        record.peers.reserve(entry.second.peers.size());
+        for (const auto& peer : entry.second.peers)
+        {
+          record.peers.push_back(lws_multisig_kex_peer_snapshot{
+            peer.second.participant,
+            peer.second.multisig_info,
+            peer.second.round,
+            peer.second.updated_at
+          });
+        }
+        snapshot.records.push_back(std::move(record));
+      }
+      return snapshot;
+    }
+
+    bool save_lws_multisig_kex_registry_locked()
+    {
+      try
+      {
+        const std::string storage_path = lws_multisig_kex_storage_path();
+        std::filesystem::path path{storage_path};
+        const std::filesystem::path dir = path.parent_path();
+        if (!dir.empty())
+          std::filesystem::create_directories(dir);
+
+        lws_multisig_kex_registry_snapshot snapshot = snapshot_lws_multisig_kex_locked();
+        epee::byte_slice bytes{};
+        const std::error_code error = wire::json::to_bytes(bytes, snapshot);
+        if (error)
+          return false;
+
+        const std::string temp_path = storage_path + ".tmp";
+        {
+          std::ofstream out{temp_path, std::ios::binary | std::ios::trunc};
+          if (!out)
+            return false;
+          out.write(reinterpret_cast<const char*>(bytes.data()), std::streamsize(bytes.size()));
+          if (!out.good())
+            return false;
+        }
+        std::filesystem::rename(temp_path, storage_path);
+        return true;
+      }
+      catch (...)
+      {
+        return false;
+      }
+    }
+
+    void load_lws_multisig_kex_registry()
+    {
+      try
+      {
+        std::ifstream in{lws_multisig_kex_storage_path(), std::ios::binary};
+        if (!in)
+          return;
+        std::string content{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
+        if (content.empty())
+          return;
+
+        lws_multisig_kex_registry_snapshot snapshot{};
+        const std::error_code error = wire::json::from_bytes(std::move(content), snapshot);
+        if (error)
+          return;
+
+        std::lock_guard<std::mutex> lock{lws_multisig_kex_mutex};
+        lws_multisig_kex_records.clear();
+        for (auto& item : snapshot.records)
+        {
+          if (item.wallet_id.empty())
+            continue;
+          lws_multisig_kex_record record{};
+          record.wallet_id = std::move(item.wallet_id);
+          record.context = std::move(item.context);
+          record.threshold = item.threshold;
+          record.total = item.total;
+          record.participants = std::move(item.participants);
+          record.address = std::move(item.address);
+          record.state = std::move(item.state);
+          record.created_at = item.created_at;
+          record.updated_at = item.updated_at;
+          for (auto& peer : item.peers)
+          {
+            if (peer.participant.empty())
+              continue;
+            const std::string key = peer.participant;
+            record.peers[key] = lws_multisig_kex_peer{
+              std::move(peer.participant),
+              std::move(peer.multisig_info),
+              peer.round,
+              peer.updated_at
+            };
+          }
+          const std::string key = record.wallet_id;
+          lws_multisig_kex_records[key] = std::move(record);
+        }
+      }
+      catch (...)
+      {}
+    }
+
+    bool is_hex_string(const std::string& value) noexcept
+    {
+      return !value.empty() && std::all_of(value.begin(), value.end(), [](const unsigned char ch) {
+        return std::isxdigit(ch) != 0;
+      });
+    }
+
+    std::string stable_txset_id(const std::string& wallet_id, const std::string& multisig_address, const std::string& tx_data_hex)
+    {
+      crypto::hash hash{};
+      cn_fast_hash(tx_data_hex.data(), tx_data_hex.size(), hash);
+      return wallet_id + ":" + multisig_address + ":" + epee::string_tools::pod_to_hex(hash);
+    }
+
+    std::string txset_content_hash(const std::string& tx_data_hex)
+    {
+      crypto::hash hash{};
+      cn_fast_hash(tx_data_hex.data(), tx_data_hex.size(), hash);
+      return epee::string_tools::pod_to_hex(hash);
+    }
+
+    bool txset_is_expired(const lws_unstake_txset_record& record, const std::uint64_t now) noexcept
+    {
+      const std::uint64_t last_seen = std::max(record.created_at, record.updated_at);
+      return last_seen == 0 || now > last_seen + lws_unstake_txset_ttl_seconds;
+    }
+
+    bool multisig_kex_is_expired(const lws_multisig_kex_record& record, const std::uint64_t now) noexcept
+    {
+      if (record.state == "active" || record.state == "finalized")
+        return false;
+      const std::uint64_t last_seen = std::max(kex_unix_seconds(record.created_at), kex_unix_seconds(record.updated_at));
+      return last_seen == 0 || now > last_seen + lws_multisig_kex_ttl_seconds;
+    }
+
+    void prune_lws_multisig_kex_locked(const std::uint64_t now)
+    {
+      bool changed = false;
+      for (auto it = lws_multisig_kex_records.begin(); it != lws_multisig_kex_records.end(); )
+      {
+        if (multisig_kex_is_expired(it->second, now))
+        {
+          it = lws_multisig_kex_records.erase(it);
+          changed = true;
+        }
+        else
+          ++it;
+      }
+
+      while (lws_multisig_kex_ttl_seconds < now && lws_multisig_kex_max_entries <= lws_multisig_kex_records.size())
+      {
+        auto oldest = lws_multisig_kex_records.end();
+        for (auto it = lws_multisig_kex_records.begin(); it != lws_multisig_kex_records.end(); ++it)
+        {
+          if (it->second.state == "active" || it->second.state == "finalized")
+            continue;
+          if (oldest == lws_multisig_kex_records.end() || it->second.updated_at < oldest->second.updated_at)
+            oldest = it;
+        }
+        if (oldest == lws_multisig_kex_records.end())
+          break;
+        lws_multisig_kex_records.erase(oldest);
+        changed = true;
+      }
+      if (changed)
+        save_lws_multisig_kex_registry_locked();
+    }
+
+    std::vector<std::string> participants_for_kex(const std::string& context, const std::string& participant)
+    {
+      if (context == "task_payment")
+        return {participant, "oracle", "pool"};
+      return {participant, "oracle", "dao"};
+    }
+
+    std::vector<std::string> peer_infos_for_round(const lws_multisig_kex_record& record, const std::string& participant, const std::uint32_t round)
+    {
+      std::vector<std::string> infos{};
+      for (const auto& peer : record.peers)
+      {
+        if (peer.first == participant || peer.second.round != round || peer.second.multisig_info.empty())
+          continue;
+        infos.push_back(peer.second.multisig_info);
+      }
+      return infos;
+    }
+
+    std::vector<std::string> submitted_participants_for_kex(const lws_multisig_kex_record& record)
+    {
+      std::vector<std::string> out{};
+      out.reserve(record.peers.size());
+      for (const auto& peer : record.peers)
+      {
+        if (!peer.second.multisig_info.empty())
+          out.push_back(peer.first);
+      }
+      std::sort(out.begin(), out.end());
+      return out;
+    }
+
+    std::vector<std::string> missing_participants_for_kex(const lws_multisig_kex_record& record)
+    {
+      std::vector<std::string> out{};
+      for (const auto& participant : record.participants)
+      {
+        const auto it = record.peers.find(participant);
+        if (it == record.peers.end() || it->second.multisig_info.empty())
+          out.push_back(participant);
+      }
+      return out;
+    }
+
+    std::uint32_t max_round_for_kex(const lws_multisig_kex_record& record) noexcept
+    {
+      std::uint32_t round = 0;
+      for (const auto& peer : record.peers)
+        round = std::max(round, peer.second.round);
+      return round;
+    }
+
+    void prune_lws_unstake_txsets_locked(const std::uint64_t now)
+    {
+      for (auto it = lws_unstake_txsets.begin(); it != lws_unstake_txsets.end(); )
+      {
+        if (txset_is_expired(it->second, now))
+          it = lws_unstake_txsets.erase(it);
+        else
+          ++it;
+      }
+
+      while (lws_unstake_txset_ttl_seconds < now && lws_unstake_txsets_max_entries <= lws_unstake_txsets.size())
+      {
+        auto oldest = lws_unstake_txsets.end();
+        for (auto it = lws_unstake_txsets.begin(); it != lws_unstake_txsets.end(); ++it)
+        {
+          if (oldest == lws_unstake_txsets.end() || it->second.updated_at < oldest->second.updated_at)
+            oldest = it;
+        }
+        if (oldest == lws_unstake_txsets.end())
+          break;
+        lws_unstake_txsets.erase(oldest);
+      }
+    }
 
     db::block_id select_auto_rescan_height(const db::account& account, const std::uint64_t depth) noexcept
     {
@@ -3140,6 +3608,298 @@ namespace lws
       }
     };
 
+    struct multisig_kex_submit
+    {
+      using request = rpc::multisig_kex_submit_request;
+      using response = rpc::multisig_kex_response;
+
+      static expect<response> handle(const request& req, connection_data&, std::function<async_complete>&&)
+      {
+        if (req.context.empty() || req.participant.empty() || req.multisig_info.empty())
+          return response{false, req.wallet_id, "failed", req.threshold, req.total, {}, {}, "context, participant and multisig_info are required", req.created_at};
+        if (req.threshold == 0 || req.total == 0 || req.threshold > req.total || req.total > 8)
+          return response{false, req.wallet_id, "failed", req.threshold, req.total, {}, {}, "invalid multisig threshold/total", req.created_at};
+        if (!has_valid_kex_participant_auth(req.participant, req.auth_token))
+          return response{false, req.wallet_id, "failed", req.threshold, req.total, {}, {}, "unauthorized KEX participant submit", req.created_at};
+
+        const std::uint64_t now = txset_unix_now();
+        const std::string wallet_id = req.wallet_id.empty() ? req.context + ":" + req.participant : req.wallet_id;
+        std::lock_guard<std::mutex> lock{lws_multisig_kex_mutex};
+        prune_lws_multisig_kex_locked(now);
+        const auto before = lws_multisig_kex_records.find(wallet_id);
+        const bool had_previous = before != lws_multisig_kex_records.end();
+        const lws_multisig_kex_record previous = had_previous ? before->second : lws_multisig_kex_record{};
+        if (lws_multisig_kex_records.find(wallet_id) == lws_multisig_kex_records.end() && lws_multisig_kex_max_entries <= lws_multisig_kex_records.size())
+          return response{false, wallet_id, "failed", req.threshold, req.total, {}, {}, "LWS multisig KEX registry capacity reached", req.created_at};
+
+        auto& record = lws_multisig_kex_records[wallet_id];
+        if (record.wallet_id.empty())
+        {
+          record.wallet_id = wallet_id;
+          record.context = req.context;
+          record.threshold = req.threshold;
+          record.total = req.total;
+          record.participants = participants_for_kex(req.context, req.participant);
+          record.state = "pending_peers";
+          record.created_at = req.created_at == 0 ? now * 1000 : req.created_at;
+        }
+        if (record.context != req.context)
+          return response{false, wallet_id, "failed", record.threshold, record.total, record.participants, {}, "wallet_id already exists with a different context", record.created_at};
+
+        record.threshold = req.threshold;
+        record.total = req.total;
+        record.updated_at = now;
+        if (std::find(record.participants.begin(), record.participants.end(), req.participant) == record.participants.end())
+          record.participants.push_back(req.participant);
+        const std::uint32_t round = req.round == 0 ? 1 : req.round;
+        record.peers[req.participant] = lws_multisig_kex_peer{req.participant, req.multisig_info, round, now};
+
+        const auto peer_infos = peer_infos_for_round(record, req.participant, round);
+        const std::size_t required_peer_count = record.total <= 1 ? 0 : std::size_t(record.total - 1);
+        if (record.state != "active")
+          record.state = peer_infos.size() >= required_peer_count ? "ready_to_make" : "pending_peers";
+        if (!save_lws_multisig_kex_registry_locked())
+        {
+          const auto failed_threshold = record.threshold;
+          const auto failed_total = record.total;
+          const auto failed_participants = record.participants;
+          const auto failed_created_at = record.created_at;
+          if (had_previous)
+            lws_multisig_kex_records[wallet_id] = previous;
+          else
+            lws_multisig_kex_records.erase(wallet_id);
+          return response{false, wallet_id, "failed", failed_threshold, failed_total, failed_participants, {}, "failed to persist LWS multisig KEX registry", failed_created_at};
+        }
+        const std::string message = record.state == "ready_to_make"
+          ? "LWS KEX peer info is ready for local WASM multisig make/exchange"
+          : "LWS KEX peer info stored; waiting for remaining participants";
+        return response{true, wallet_id, record.state, record.threshold, record.total, record.participants, peer_infos, message, record.created_at};
+      }
+    };
+
+    struct multisig_kex_status
+    {
+      using request = rpc::multisig_kex_status_request;
+      using response = rpc::multisig_kex_status_response;
+
+      static expect<response> handle(const request& req, connection_data&, std::function<async_complete>&&)
+      {
+        if (req.wallet_id.empty())
+          return response{false, req.wallet_id, req.context, "failed", 0, 0, {}, {}, {}, 0, "", "wallet_id is required", 0, 0};
+
+        const std::uint64_t now = txset_unix_now();
+        std::lock_guard<std::mutex> lock{lws_multisig_kex_mutex};
+        prune_lws_multisig_kex_locked(now);
+        const auto it = lws_multisig_kex_records.find(req.wallet_id);
+        if (it == lws_multisig_kex_records.end())
+          return response{false, req.wallet_id, req.context, "not_found", 0, 0, {}, {}, {}, 0, "", "wallet_id is not registered in LWS KEX registry", 0, 0};
+        if (!req.context.empty() && it->second.context != req.context)
+          return response{false, req.wallet_id, req.context, "failed", it->second.threshold, it->second.total, it->second.participants, {}, {}, max_round_for_kex(it->second), it->second.address, "wallet_id exists with a different context", it->second.created_at, it->second.updated_at};
+
+        return response{
+          true,
+          it->second.wallet_id,
+          it->second.context,
+          it->second.state,
+          it->second.threshold,
+          it->second.total,
+          it->second.participants,
+          submitted_participants_for_kex(it->second),
+          missing_participants_for_kex(it->second),
+          max_round_for_kex(it->second),
+          it->second.address,
+          "LWS KEX status loaded",
+          it->second.created_at,
+          it->second.updated_at
+        };
+      }
+    };
+
+    struct multisig_kex_finalize
+    {
+      using request = rpc::multisig_kex_finalize_request;
+      using response = rpc::multisig_kex_finalize_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        if (req.wallet_id.empty() || req.address.empty())
+          return response{false, "wallet_id and address are required"};
+        const auto parsed = db::address_string(req.address);
+        if (!parsed)
+          return response{false, "Invalid multisig address"};
+
+        lws_multisig_kex_record previous{};
+        lws_multisig_kex_record snapshot{};
+        {
+          std::lock_guard<std::mutex> lock{lws_multisig_kex_mutex};
+          auto it = lws_multisig_kex_records.find(req.wallet_id);
+          if (it == lws_multisig_kex_records.end())
+            return response{false, "wallet_id is not registered in LWS KEX registry"};
+          previous = it->second;
+          it->second.address = req.address;
+          it->second.state = req.status.empty() ? "active" : req.status;
+          it->second.updated_at = txset_unix_now();
+          if (!save_lws_multisig_kex_registry_locked())
+          {
+            it->second = previous;
+            return response{false, "Failed to persist finalized KEX registry state"};
+          }
+          snapshot = it->second;
+        }
+
+        db::multisig_wallet_record record{};
+        record.wallet_id = snapshot.wallet_id;
+        record.address = req.address;
+        record.context = req.context.empty() ? snapshot.context : req.context;
+        record.threshold = snapshot.threshold;
+        record.total = snapshot.total;
+        record.participants = snapshot.participants;
+        record.status = req.status.empty() ? "active" : req.status;
+        record.created_at = snapshot.created_at;
+
+        if (!data.global->multisig.register_wallet(record))
+        {
+          std::lock_guard<std::mutex> lock{lws_multisig_kex_mutex};
+          lws_multisig_kex_records[req.wallet_id] = previous;
+          save_lws_multisig_kex_registry_locked();
+          return response{false, "Failed to register finalized KEX wallet"};
+        }
+        return response{true, "KEX wallet finalized and registered successfully"};
+      }
+    };
+
+    struct multisig_txset_register
+    {
+      using request = rpc::multisig_txset_register_request;
+      using response = rpc::multisig_txset_register_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        rpc::account_credentials creds{req.address, req.key};
+        auto user = open_account(creds, data.global->disk.clone());
+        if (!user)
+          return user.error();
+
+        const std::string owner_address = db::address_string(req.address);
+        const auto parsed = db::address_string(req.multisig_address);
+        if (!parsed)
+          return response{false, "", "failed", "Invalid multisig_address"};
+        if (req.wallet_id.empty())
+          return response{false, "", "failed", "wallet_id is required"};
+        if (req.purpose != "miner_unstake")
+          return response{false, "", "failed", "Only miner_unstake txsets are supported"};
+        if (!is_hex_string(req.tx_data_hex) || req.tx_data_hex.size() <= 64)
+          return response{false, "", "failed", "tx_data_hex must be a non-empty hex txset, not a tx hash or placeholder"};
+        if (req.tx_data_hex.rfind("unsigned_emergency_unstake_", 0) == 0 || req.tx_data_hex.rfind("mock_", 0) == 0)
+          return response{false, "", "failed", "mock or placeholder unstake txset is rejected"};
+        if (req.miner_address != owner_address)
+          return response{false, "", "failed", "miner_address must match authenticated wallet address"};
+
+        const std::string tx_data_hash = txset_content_hash(req.tx_data_hex);
+        const std::string txset_id = stable_txset_id(req.wallet_id, req.multisig_address, req.tx_data_hex);
+        const std::uint64_t now = txset_unix_now();
+
+        std::lock_guard<std::mutex> lock{lws_unstake_txsets_mutex};
+        prune_lws_unstake_txsets_locked(now);
+        const auto existing = lws_unstake_txsets.find(txset_id);
+        if (existing == lws_unstake_txsets.end() && lws_unstake_txsets_max_entries <= lws_unstake_txsets.size())
+          return response{false, "", "failed", "LWS unstake txset registry capacity reached"};
+        auto& record = lws_unstake_txsets[txset_id];
+        if (record.txset_id.empty())
+        {
+          record.owner_address = owner_address;
+          record.wallet_id = req.wallet_id;
+          record.multisig_address = req.multisig_address;
+          record.txset_id = txset_id;
+          record.tx_data_hash = tx_data_hash;
+          record.miner_address = req.miner_address;
+          record.state = "registered";
+          record.collected_signatures = 0;
+          record.required_signatures = 2;
+          record.created_at = now;
+        }
+        record.updated_at = now;
+
+        return response{true, txset_id, record.state, ""};
+      }
+    };
+
+    struct multisig_txset_signature
+    {
+      using request = rpc::multisig_txset_signature_request;
+      using response = rpc::multisig_txset_signature_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        rpc::account_credentials creds{req.address, req.key};
+        auto user = open_account(creds, data.global->disk.clone());
+        if (!user)
+          return user.error();
+
+        const std::string owner_address = db::address_string(req.address);
+        if (req.wallet_id.empty() || req.multisig_address.empty())
+          return response{false, req.txset_id, "failed", 0, 2, "", "wallet_id and multisig_address are required"};
+        if (req.signer_role != "miner")
+          return response{false, req.txset_id, "failed", 0, 2, "", "Only miner signatures are accepted from browser wallet"};
+        if (!is_hex_string(req.signed_tx_data_hex) || req.signed_tx_data_hex.size() <= 64)
+          return response{false, req.txset_id, "failed", 0, 2, "", "signed_tx_data_hex must be a real hex txset"};
+        if (req.signer_address != owner_address)
+          return response{false, req.txset_id, "failed", 0, 2, "", "signer_address must match authenticated wallet address"};
+
+        std::lock_guard<std::mutex> lock{lws_unstake_txsets_mutex};
+        prune_lws_unstake_txsets_locked(txset_unix_now());
+        auto it = lws_unstake_txsets.find(req.txset_id);
+        if (it == lws_unstake_txsets.end())
+          return response{false, req.txset_id, "failed", 0, 2, "", "txset_id is not registered"};
+
+        auto& record = it->second;
+        if (record.wallet_id != req.wallet_id || record.multisig_address != req.multisig_address)
+          return response{false, req.txset_id, "failed", record.collected_signatures, record.required_signatures, "", "txset metadata mismatch"};
+        if (record.owner_address != owner_address || record.miner_address != req.signer_address)
+          return response{false, req.txset_id, "failed", record.collected_signatures, record.required_signatures, "", "signer does not match registered miner wallet"};
+
+        record.signed_tx_data_hash = txset_content_hash(req.signed_tx_data_hex);
+        record.collected_signatures = std::max<std::uint32_t>(record.collected_signatures, 1);
+        record.state = "needs_more_signatures";
+        record.updated_at = txset_unix_now();
+
+        return response{true, record.txset_id, record.state, record.collected_signatures, record.required_signatures, record.submitted_tx_hash, ""};
+      }
+    };
+
+    struct multisig_txset_submit
+    {
+      using request = rpc::multisig_txset_submit_request;
+      using response = rpc::multisig_txset_submit_response;
+
+      static expect<response> handle(const request& req, connection_data& data, std::function<async_complete>&&)
+      {
+        rpc::account_credentials creds{req.address, req.key};
+        auto user = open_account(creds, data.global->disk.clone());
+        if (!user)
+          return user.error();
+
+        const std::string owner_address = db::address_string(req.address);
+        std::lock_guard<std::mutex> lock{lws_unstake_txsets_mutex};
+        prune_lws_unstake_txsets_locked(txset_unix_now());
+        auto it = lws_unstake_txsets.find(req.txset_id);
+        if (it == lws_unstake_txsets.end())
+          return response{false, "", "failed", "txset_id is not registered"};
+
+        auto& record = it->second;
+        if (record.wallet_id != req.wallet_id || record.multisig_address != req.multisig_address)
+          return response{false, "", "failed", "txset metadata mismatch"};
+        if (record.owner_address != owner_address)
+          return response{false, "", "failed", "authenticated wallet does not own this txset"};
+        if (record.collected_signatures < record.required_signatures)
+          return response{true, "", "needs_more_signatures", "More multisig signatures are required before submit"};
+        if (record.submitted_tx_hash.empty())
+          return response{false, "", "failed", "LWS does not yet have a fully signed raw tx submitter for multisig txsets"};
+
+        return response{true, record.submitted_tx_hash, "submitted", ""};
+      }
+    };
+
     struct provision_subaddrs
     {
       using request = rpc::provision_subaddrs_request;
@@ -3658,9 +4418,15 @@ namespace lws
       {"/import_wallet_request", call<import_request>,     2 * 1024, false},
       {"/login",                 call<login>,              2 * 1024, false},
       {"/multisig/balance",          call<multisig_balance>,                  2 * 1024, false},
+      {"/multisig/kex/finalize",     call<multisig_kex_finalize>,             4 * 1024, false},
+      {"/multisig/kex/submit",       call<multisig_kex_submit>,               64 * 1024, false},
+      {"/multisig/kex/status",       call<multisig_kex_status>,               2 * 1024, false},
       {"/multisig/register_tx",      call<multisig_register>,                 4 * 1024, false},
       {"/multisig/register_wallet",  call<multisig_register_wallet_handler>,  4 * 1024, false},
       {"/multisig/transactions",     call<multisig_txs>,                      2 * 1024, false},
+      {"/multisig/txsets/register",  call<multisig_txset_register>,           512 * 1024, false},
+      {"/multisig/txsets/signature", call<multisig_txset_signature>,          512 * 1024, false},
+      {"/multisig/txsets/submit",    call<multisig_txset_submit>,             4 * 1024, false},
       {"/multisig/wallets",          call<multisig_list_wallets>,             1024,     false},
       {"/provision_subaddrs",    call<provision_subaddrs>, 2 * 1024, false},
       {"/request_rescan",        call<request_rescan>,     2 * 1024, false},
@@ -4133,6 +4899,8 @@ namespace lws
   {
     if (addresses.empty())
       MONERO_THROW(common_error::kInvalidArgument, "REST server requires 1 or more addresses");
+
+    load_lws_multisig_kex_registry();
 
     std::sort(admin.begin(), admin.end());
     const auto init_port = [this, &admin] (internal& port, const std::string& address, configuration config, const bool is_admin) -> bool
